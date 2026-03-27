@@ -106,50 +106,65 @@ pub const Store = struct {
         }
     }
 
-    fn migrate(self: *Self) !void {
-        // Migration 001
-        const sql_001 = @embedFile("migrations/001_init.sql");
+    fn getUserVersion(self: *Self) i64 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, "PRAGMA user_version;", -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return 0;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        return 0;
+    }
+
+    fn setUserVersion(self: *Self, version: i64) void {
+        var buf: [64]u8 = undefined;
+        const sql = std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{version}) catch return;
         var err_msg: [*c]u8 = null;
-        var prc = c.sqlite3_exec(self.db, sql_001.ptr, null, null, &err_msg);
+        _ = c.sqlite3_exec(self.db, @ptrCast(sql.ptr), null, null, &err_msg);
+        if (err_msg) |msg| c.sqlite3_free(msg);
+    }
+
+    fn runMigration(self: *Self, num: i64, sql: [*:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const prc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
         if (prc != c.SQLITE_OK) {
             if (err_msg) |msg| {
-                log.err("migration 001 failed (rc={d}): {s}", .{ prc, std.mem.span(msg) });
+                log.err("migration {d:0>3} failed (rc={d}): {s}", .{ num, prc, std.mem.span(msg) });
                 c.sqlite3_free(msg);
             }
             return error.MigrationFailed;
+        }
+        self.setUserVersion(num);
+        log.info("migration {d:0>3} applied", .{num});
+    }
+
+    fn migrate(self: *Self) !void {
+        const current = self.getUserVersion();
+        log.info("schema user_version={d}", .{current});
+
+        // Migration 001
+        if (current < 1) {
+            const sql_001 = @embedFile("migrations/001_init.sql");
+            try self.runMigration(1, sql_001.ptr);
         }
 
         // Migration 002 — new tables (idempotent via IF NOT EXISTS)
-        const sql_002 = @embedFile("migrations/002_advanced_steps.sql");
-        prc = c.sqlite3_exec(self.db, sql_002.ptr, null, null, &err_msg);
-        if (prc != c.SQLITE_OK) {
-            if (err_msg) |msg| {
-                log.err("migration 002 failed (rc={d}): {s}", .{ prc, std.mem.span(msg) });
-                c.sqlite3_free(msg);
-            }
-            return error.MigrationFailed;
+        if (current < 2) {
+            const sql_002 = @embedFile("migrations/002_advanced_steps.sql");
+            try self.runMigration(2, sql_002.ptr);
         }
 
         // Migration 003 — tracker integration state
-        const sql_003 = @embedFile("migrations/003_tracker.sql");
-        prc = c.sqlite3_exec(self.db, sql_003.ptr, null, null, &err_msg);
-        if (prc != c.SQLITE_OK) {
-            if (err_msg) |msg| {
-                log.err("migration 003 failed (rc={d}): {s}", .{ prc, std.mem.span(msg) });
-                c.sqlite3_free(msg);
-            }
-            return error.MigrationFailed;
+        if (current < 3) {
+            const sql_003 = @embedFile("migrations/003_tracker.sql");
+            try self.runMigration(3, sql_003.ptr);
         }
 
         // Migration 004 — orchestration schema (workflows, checkpoints, agent_events)
-        const sql_004 = @embedFile("migrations/004_orchestration.sql");
-        prc = c.sqlite3_exec(self.db, sql_004.ptr, null, null, &err_msg);
-        if (prc != c.SQLITE_OK) {
-            if (err_msg) |msg| {
-                log.err("migration 004 failed (rc={d}): {s}", .{ prc, std.mem.span(msg) });
-                c.sqlite3_free(msg);
-            }
-            return error.MigrationFailed;
+        if (current < 4) {
+            const sql_004 = @embedFile("migrations/004_orchestration.sql");
+            try self.runMigration(4, sql_004.ptr);
         }
     }
 
