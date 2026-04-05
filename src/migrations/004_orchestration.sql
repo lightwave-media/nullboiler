@@ -49,22 +49,10 @@ CREATE TABLE IF NOT EXISTS pending_state_injections (
     created_at_ms INTEGER NOT NULL
 );
 
--- Extend runs table
-ALTER TABLE runs ADD COLUMN state_json TEXT;
-ALTER TABLE runs ADD COLUMN workflow_id TEXT REFERENCES workflows(id);
-ALTER TABLE runs ADD COLUMN forked_from_run_id TEXT REFERENCES runs(id);
-ALTER TABLE runs ADD COLUMN forked_from_checkpoint_id TEXT REFERENCES checkpoints(id);
-ALTER TABLE runs ADD COLUMN checkpoint_count INTEGER DEFAULT 0;
-
--- Extend steps table
-ALTER TABLE steps ADD COLUMN state_before_json TEXT;
-ALTER TABLE steps ADD COLUMN state_after_json TEXT;
-ALTER TABLE steps ADD COLUMN state_updates_json TEXT;
--- NOTE: parent_step_id already exists from 001_init.sql — do NOT add it again
-
--- Subgraph support: parent run linkage and per-run config
-ALTER TABLE runs ADD COLUMN parent_run_id TEXT REFERENCES runs(id);
-ALTER TABLE runs ADD COLUMN config_json TEXT;
+-- Extend runs/steps tables.
+-- These columns are added conditionally from store.zig because SQLite does not
+-- support ALTER TABLE ADD COLUMN IF NOT EXISTS.
+-- NOTE: parent_step_id already exists from 001_init.sql — do NOT add it again.
 
 -- Node-level cache (Gap 3)
 CREATE TABLE IF NOT EXISTS node_cache (
@@ -86,12 +74,5 @@ CREATE TABLE IF NOT EXISTS pending_writes (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_writes_run ON pending_writes(run_id);
 
--- Token accounting columns on runs
-ALTER TABLE runs ADD COLUMN total_input_tokens INTEGER DEFAULT 0;
-ALTER TABLE runs ADD COLUMN total_output_tokens INTEGER DEFAULT 0;
-ALTER TABLE runs ADD COLUMN total_tokens INTEGER DEFAULT 0;
-
--- Token accounting columns on steps
-ALTER TABLE steps ADD COLUMN input_tokens INTEGER DEFAULT 0;
-ALTER TABLE steps ADD COLUMN output_tokens INTEGER DEFAULT 0;
-ALTER TABLE steps ADD COLUMN total_tokens INTEGER DEFAULT 0;
+-- Token accounting columns on runs/steps are also added conditionally from
+-- store.zig for the same reason.
