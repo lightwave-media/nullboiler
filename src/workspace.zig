@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.workspace);
 
 /// Sanitize an ID for safe use as a directory name.
@@ -28,13 +29,13 @@ pub fn validateWorkspacePath(allocator: std.mem.Allocator, workspace_root: []con
     }
 
     // Canonicalize both paths (resolves symlinks)
-    const canon_root = std.fs.cwd().realpathAlloc(allocator, workspace_root) catch {
+    const canon_root = std_compat.fs.cwd().realpathAlloc(allocator, workspace_root) catch {
         log.warn("workspace: cannot resolve root {s}", .{workspace_root});
         return false;
     };
     defer allocator.free(canon_root);
 
-    const canon_path = std.fs.cwd().realpathAlloc(allocator, workspace_path) catch {
+    const canon_path = std_compat.fs.cwd().realpathAlloc(allocator, workspace_path) catch {
         log.warn("workspace: cannot resolve path {s}", .{workspace_path});
         return false;
     };
@@ -79,14 +80,14 @@ pub const Workspace = struct {
         const path = try std.fs.path.join(allocator, &.{ root, safe_id });
 
         // Ensure root directory exists
-        std.fs.cwd().makePath(root) catch |err| {
+        std_compat.fs.cwd().makePath(root) catch |err| {
             log.warn("workspace: failed to create root {s}: {}", .{ root, err });
             return err;
         };
 
         // Try to create the workspace directory; track whether it already existed
         var created = true;
-        std.fs.cwd().makePath(path) catch |err| {
+        std_compat.fs.cwd().makePath(path) catch |err| {
             log.warn("workspace: failed to create workspace dir {s}: {}", .{ path, err });
             return err;
         };
@@ -99,7 +100,7 @@ pub const Workspace = struct {
         }
 
         // If the directory already had contents it was not freshly created
-        var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+        var dir = try std_compat.fs.cwd().openDir(path, .{ .iterate = true });
         defer dir.close();
 
         var iter = dir.iterate();
@@ -119,7 +120,7 @@ pub const Workspace = struct {
 
     /// Remove the workspace directory tree. Logs a warning on failure.
     pub fn remove(self: *const Workspace) void {
-        std.fs.cwd().deleteTree(self.path) catch |err| {
+        std_compat.fs.cwd().deleteTree(self.path) catch |err| {
             log.warn("workspace: failed to remove {s}: {}", .{ self.path, err });
             return;
         };
@@ -130,7 +131,7 @@ pub const Workspace = struct {
 /// Remove all subdirectories under the workspace root.
 /// Used for startup cleanup — workspaces are ephemeral and will be recreated by hooks.
 pub fn cleanAll(root: []const u8) void {
-    var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch |err| {
+    var dir = std_compat.fs.cwd().openDir(root, .{ .iterate = true }) catch |err| {
         log.warn("workspace: cannot open root {s} for cleanup: {}", .{ root, err });
         return;
     };
@@ -173,7 +174,7 @@ pub fn runHook(allocator: std.mem.Allocator, command: []const u8, cwd: []const u
     else
         [_][]const u8{ "/bin/sh", "-lc", command };
 
-    var child = std.process.Child.init(&argv, allocator);
+    var child = std_compat.process.Child.init(&argv, allocator);
     child.cwd = cwd;
 
     // We don't need to capture output for hooks — inherit parent stdio
@@ -197,14 +198,14 @@ pub fn runHook(allocator: std.mem.Allocator, command: []const u8, cwd: []const u
         return false;
     };
 
-    const success = term == .Exited and term.Exited == 0;
+    const success = term == .exited and term.exited == 0;
     if (!success) {
         log.warn("hook exited non-zero: {s}", .{command});
     }
     return success;
 }
 
-fn killAfterTimeout(child: *std.process.Child, timeout_ms: u64, done: *std.atomic.Value(bool)) void {
+fn killAfterTimeout(child: *std_compat.process.Child, timeout_ms: u64, done: *std.atomic.Value(bool)) void {
     // Poll in 100ms increments so we exit promptly once the child finishes
     const poll_ns: u64 = 100 * std.time.ns_per_ms;
     var elapsed_ns: u64 = 0;
@@ -212,7 +213,7 @@ fn killAfterTimeout(child: *std.process.Child, timeout_ms: u64, done: *std.atomi
 
     while (elapsed_ns < deadline_ns) {
         if (done.load(.acquire)) return;
-        std.Thread.sleep(poll_ns);
+        std_compat.thread.sleep(poll_ns);
         elapsed_ns += poll_ns;
     }
 
@@ -250,7 +251,7 @@ test "Workspace create and remove" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
 
     const ws = try Workspace.create(allocator, root, "test-task");
@@ -260,14 +261,14 @@ test "Workspace create and remove" {
     try std.testing.expect(ws.created);
 
     // Directory should exist
-    var dir = try std.fs.cwd().openDir(ws.path, .{});
+    var dir = try std_compat.fs.cwd().openDir(ws.path, .{});
     dir.close();
 
     // Remove it
     ws.remove();
 
     // Directory should no longer exist
-    const open_result = std.fs.cwd().openDir(ws.path, .{});
+    const open_result = std_compat.fs.cwd().openDir(ws.path, .{});
     try std.testing.expectError(error.FileNotFound, open_result);
 }
 
@@ -279,7 +280,7 @@ test "runHook executes shell command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
     // Run a command that creates a file
@@ -287,7 +288,7 @@ test "runHook executes shell command" {
     try std.testing.expect(ok);
 
     // Verify the file was created
-    const contents = try tmp.dir.readFileAlloc(allocator, "test.txt", 1024);
+    const contents = try std_compat.fs.Dir.wrap(tmp.dir).readFileAlloc(allocator, "test.txt", 1024);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("hello\n", contents);
 }
@@ -300,7 +301,7 @@ test "runHook returns false for failing command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
     const ok = try runHook(allocator, "exit 1", cwd, 5000);
@@ -312,18 +313,18 @@ test "cleanAll removes all subdirectories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
 
     // Create some fake workspace dirs
-    try tmp.dir.makeDir("task-001");
-    try tmp.dir.makeDir("task-002");
+    try std_compat.fs.Dir.wrap(tmp.dir).makeDir("task-001");
+    try std_compat.fs.Dir.wrap(tmp.dir).makeDir("task-002");
 
     cleanAll(root);
 
     // Verify they're gone
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("task-001", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("task-002", .{}));
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.Dir.wrap(tmp.dir).openDir("task-001", .{}));
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.Dir.wrap(tmp.dir).openDir("task-002", .{}));
 }
 
 test "validateWorkspacePath accepts safe path" {
@@ -331,11 +332,11 @@ test "validateWorkspacePath accepts safe path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
 
     // Create a subdirectory
-    try tmp.dir.makeDir("safe-task");
+    try std_compat.fs.Dir.wrap(tmp.dir).makeDir("safe-task");
     const sub_path = try std.fs.path.join(allocator, &.{ root, "safe-task" });
     defer allocator.free(sub_path);
 
@@ -347,7 +348,7 @@ test "validateWorkspacePath rejects path outside root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
 
     // /tmp is definitely not under the test temp dir

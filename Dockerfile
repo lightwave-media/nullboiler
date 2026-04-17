@@ -4,7 +4,23 @@
 # Build on the native builder architecture and cross-compile with Zig.
 FROM --platform=$BUILDPLATFORM alpine:3.23 AS builder
 
-RUN apk add --no-cache zig musl-dev
+ARG ZIG_VERSION=0.16.0
+
+RUN apk add --no-cache bash curl musl-dev python3 tar xz
+
+COPY .github/scripts/install-zig.sh /tmp/install-zig.sh
+RUN set -eu; \
+    export GITHUB_PATH=/tmp/zig-path; \
+    export RUNNER_OS=Linux; \
+    case "$(uname -m)" in \
+      x86_64) export RUNNER_ARCH=X64 ;; \
+      aarch64|arm64) export RUNNER_ARCH=ARM64 ;; \
+      *) echo "Unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    bash /tmp/install-zig.sh "${ZIG_VERSION}"; \
+    zig_dir="$(cat /tmp/zig-path)"; \
+    ln -sf "${zig_dir}/zig" /usr/local/bin/zig; \
+    zig version
 
 WORKDIR /app
 COPY build.zig build.zig.zon ./
@@ -12,7 +28,9 @@ COPY src/ src/
 COPY deps/ deps/
 
 ARG TARGETARCH
-RUN set -eu; \
+RUN --mount=type=cache,target=/root/.cache/zig \
+    --mount=type=cache,target=/app/.zig-cache \
+    set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
       case "$(uname -m)" in \

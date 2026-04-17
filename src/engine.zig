@@ -23,6 +23,7 @@
 ///   - Configurable runs: config stored as state.__config, accessible via templates
 ///   - Reconciliation: check nulltickets task status between steps
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.engine);
 const json = std.json;
 
@@ -223,7 +224,7 @@ pub const Engine = struct {
             self.tick() catch |err| {
                 log.err("engine tick error: {}", .{err});
             };
-            std.Thread.sleep(self.poll_interval_ns);
+            std_compat.thread.sleep(self.poll_interval_ns);
         }
         log.info("engine stopped", .{});
     }
@@ -1656,7 +1657,7 @@ pub const Engine = struct {
 
     /// Merge async_pending + correlation_id into existing input_json.
     fn mergeAsyncState(alloc: std.mem.Allocator, existing_input: []const u8, correlation_id: []const u8) ![]const u8 {
-        var obj = json.ObjectMap.init(alloc);
+        var obj: json.ObjectMap = .empty;
 
         if (existing_input.len > 0) {
             const p = json.parseFromSlice(json.Value, alloc, existing_input, .{}) catch null;
@@ -1664,14 +1665,14 @@ pub const Engine = struct {
                 if (parsed.value == .object) {
                     var it = parsed.value.object.iterator();
                     while (it.next()) |entry| {
-                        try obj.put(entry.key_ptr.*, entry.value_ptr.*);
+                        try obj.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
                     }
                 }
             }
         }
 
-        try obj.put("async_pending", .{ .bool = true });
-        try obj.put("correlation_id", .{ .string = correlation_id });
+        try obj.put(alloc, "async_pending", .{ .bool = true });
+        try obj.put(alloc, "correlation_id", .{ .string = correlation_id });
 
         return json.Stringify.valueAlloc(alloc, json.Value{ .object = obj }, .{});
     }
@@ -1738,7 +1739,7 @@ fn findReadyNodesFromRoot(
 
         var entry = inbound.getPtr(target);
         if (entry == null) {
-            try inbound.put(target, std.ArrayListUnmanaged(EdgeInfo){});
+            try inbound.put(target, .empty);
             entry = inbound.getPtr(target);
         }
         try entry.?.append(alloc, .{
@@ -1976,7 +1977,8 @@ fn encodePathSegment(allocator: std.mem.Allocator, value: []const u8) ![]const u
         {
             try buf.append(allocator, byte);
         } else {
-            try buf.writer(allocator).print("%{X:0>2}", .{byte});
+            const upper = "0123456789ABCDEF";
+            try buf.appendSlice(allocator, &.{ '%', upper[(byte >> 4) & 0x0F], upper[byte & 0x0F] });
         }
     }
 
@@ -2024,7 +2026,7 @@ fn getNodeTags(alloc: std.mem.Allocator, node_json: []const u8) []const []const 
 // ── JSON / Serialization Helpers ────────────────────────────────────
 
 fn serializeJsonValue(alloc: std.mem.Allocator, value: json.Value) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     var jw: json.Stringify = .{ .writer = &out.writer };
     try jw.write(value);
     return try out.toOwnedSlice();
@@ -2070,14 +2072,14 @@ fn buildTaskStateUpdates(alloc: std.mem.Allocator, node_json: []const u8, output
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var result = json.ObjectMap.init(arena_alloc);
+    var result: json.ObjectMap = .empty;
     const parsed_output = json.parseFromSlice(json.Value, arena_alloc, output, .{}) catch null;
 
     if (output_key) |key| {
         if (parsed_output) |parsed| {
-            try result.put(key, parsed.value);
+            try result.put(arena_alloc, key, parsed.value);
         } else {
-            try result.put(key, .{ .string = output });
+            try result.put(arena_alloc, key, .{ .string = output });
         }
     }
 
@@ -2092,7 +2094,7 @@ fn buildTaskStateUpdates(alloc: std.mem.Allocator, node_json: []const u8, output
                     const raw_val = state_mod.getStateValue(arena_alloc, output, source_path) catch null;
                     if (raw_val) |value_json| {
                         const parsed_value = json.parseFromSlice(json.Value, arena_alloc, value_json, .{}) catch continue;
-                        try result.put(entry.key_ptr.*, parsed_value.value);
+                        try result.put(arena_alloc, entry.key_ptr.*, parsed_value.value);
                     }
                 }
             }
@@ -2120,19 +2122,19 @@ fn serializeRouteResults(alloc: std.mem.Allocator, route_results: *std.StringHas
 fn serializeRouteResultsWithVersion(alloc: std.mem.Allocator, route_results: *std.StringHashMap([]const u8), wf_version: ?i64) !?[]const u8 {
     if (route_results.count() == 0 and wf_version == null) return null;
 
-    var obj = json.ObjectMap.init(alloc);
+    var obj: json.ObjectMap = .empty;
 
     if (route_results.count() > 0) {
-        var rr_obj = json.ObjectMap.init(alloc);
+        var rr_obj: json.ObjectMap = .empty;
         var it = route_results.iterator();
         while (it.next()) |entry| {
-            try rr_obj.put(entry.key_ptr.*, .{ .string = entry.value_ptr.* });
+            try rr_obj.put(alloc, entry.key_ptr.*, .{ .string = entry.value_ptr.* });
         }
-        try obj.put("route_results", .{ .object = rr_obj });
+        try obj.put(alloc, "route_results", .{ .object = rr_obj });
     }
 
     if (wf_version) |v| {
-        try obj.put("workflow_version", .{ .integer = v });
+        try obj.put(alloc, "workflow_version", .{ .integer = v });
     }
 
     return try serializeJsonValue(alloc, .{ .object = obj });
@@ -2344,11 +2346,11 @@ fn stripMeta(alloc: std.mem.Allocator, state_json: []const u8) ![]const u8 {
     const parsed = json.parseFromSlice(json.Value, alloc, state_json, .{}) catch return try alloc.dupe(u8, state_json);
     if (parsed.value != .object) return try alloc.dupe(u8, state_json);
 
-    var result_obj = json.ObjectMap.init(alloc);
+    var result_obj: json.ObjectMap = .empty;
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (!std.mem.eql(u8, entry.key_ptr.*, "__meta")) {
-            try result_obj.put(entry.key_ptr.*, entry.value_ptr.*);
+            try result_obj.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
     return serializeJsonValue(alloc, .{ .object = result_obj });
@@ -2360,7 +2362,7 @@ fn buildSubgraphInput(alloc: std.mem.Allocator, parent_state: []const u8, input_
     const mapping_parsed = json.parseFromSlice(json.Value, alloc, input_mapping_json, .{}) catch return try alloc.dupe(u8, "{}");
     if (mapping_parsed.value != .object) return try alloc.dupe(u8, "{}");
 
-    var result = json.ObjectMap.init(alloc);
+    var result: json.ObjectMap = .empty;
     var it = mapping_parsed.value.object.iterator();
     while (it.next()) |entry| {
         const child_key = entry.key_ptr.*;
@@ -2369,7 +2371,7 @@ fn buildSubgraphInput(alloc: std.mem.Allocator, parent_state: []const u8, input_
         // Resolve the value from parent state
         if (state_mod.getStateValue(alloc, parent_state, parent_path) catch null) |value_str| {
             const val_parsed = json.parseFromSlice(json.Value, alloc, value_str, .{}) catch continue;
-            try result.put(child_key, val_parsed.value);
+            try result.put(alloc, child_key, val_parsed.value);
         }
     }
 
@@ -2385,10 +2387,10 @@ fn reconcileWithTracker(alloc: std.mem.Allocator, tracker_url: []const u8, track
     const url = std.fmt.allocPrint(alloc, "{s}/tasks/{s}", .{ tracker_url, task_id_enc }) catch return true;
     defer alloc.free(url);
 
-    var client: std.http.Client = .{ .allocator = alloc };
+    var client: std.http.Client = .{ .allocator = alloc, .io = std_compat.io() };
     defer client.deinit();
 
-    var response_body: std.io.Writer.Allocating = .init(alloc);
+    var response_body: std.Io.Writer.Allocating = .init(alloc);
     defer response_body.deinit();
 
     var auth_header: ?[]const u8 = null;
@@ -2564,12 +2566,12 @@ fn processUiMessages(hub: *sse_mod.SseHub, alloc: std.mem.Allocator, run_id: []c
         };
 
         // Add step_id to the event data
-        var event_obj = json.ObjectMap.init(alloc);
+        var event_obj: json.ObjectMap = .empty;
         var it = msg.object.iterator();
         while (it.next()) |entry| {
-            event_obj.put(entry.key_ptr.*, entry.value_ptr.*) catch continue;
+            event_obj.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch continue;
         }
-        event_obj.put("step_id", .{ .string = step_id }) catch {};
+        event_obj.put(alloc, "step_id", .{ .string = step_id }) catch {};
         const event_data = serializeJsonValue(alloc, .{ .object = event_obj }) catch continue;
 
         if (is_remove) {
@@ -2619,13 +2621,13 @@ fn processStreamMessages(hub: *sse_mod.SseHub, alloc: std.mem.Allocator, run_id:
         if (msg != .object) continue;
 
         // Build enriched message with step context
-        var event_obj = json.ObjectMap.init(alloc);
+        var event_obj: json.ObjectMap = .empty;
         var it = msg.object.iterator();
         while (it.next()) |entry| {
-            event_obj.put(entry.key_ptr.*, entry.value_ptr.*) catch continue;
+            event_obj.put(alloc, entry.key_ptr.*, entry.value_ptr.*) catch continue;
         }
-        event_obj.put("step_id", .{ .string = step_id }) catch {};
-        event_obj.put("node_type", .{ .string = node_type }) catch {};
+        event_obj.put(alloc, "step_id", .{ .string = step_id }) catch {};
+        event_obj.put(alloc, "node_type", .{ .string = node_type }) catch {};
         const event_data = serializeJsonValue(alloc, .{ .object = event_obj }) catch continue;
 
         hub.broadcast(run_id, .{ .event_type = "message", .data = event_data, .mode = .custom });

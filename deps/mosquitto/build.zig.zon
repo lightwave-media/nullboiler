@@ -1,7 +1,8 @@
 .{
     .name = .mosquitto,
+    .fingerprint = 0xedaa031912870053,
     .version = "2.0.18",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

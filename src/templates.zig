@@ -338,8 +338,8 @@ fn jsonValueToString(allocator: std.mem.Allocator, val: std.json.Value) RenderEr
             return allocator.dupe(u8, "null") catch return error.OutOfMemory;
         },
         .object, .array => {
-            // Serialize back to JSON string using Zig 0.15 Stringify API
-            var out: std.io.Writer.Allocating = .init(allocator);
+            // Serialize back to JSON string using Zig 0.16 Stringify API
+            var out: std.Io.Writer.Allocating = .init(allocator);
             errdefer out.deinit();
             var jw: std.json.Stringify = .{ .writer = &out.writer };
             jw.write(val) catch return error.OutOfMemory;

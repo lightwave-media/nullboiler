@@ -9,6 +9,7 @@
 ///   5. Poll NullTickets and claim new tasks (respecting concurrency limits)
 ///   6. Clean expired cooldowns
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.tracker);
 
 const config = @import("config.zig");
@@ -58,7 +59,7 @@ pub const CooldownEntry = struct {
 // ── TrackerState ────────────────────────────────────────────────────
 
 pub const TrackerState = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     running: std.StringArrayHashMapUnmanaged(RunningTask),
     completed_count: u64,
     failed_count: u64,
@@ -281,7 +282,7 @@ pub const Tracker = struct {
             self.tick() catch |err| {
                 log.err("tracker tick error: {}", .{err});
             };
-            std.Thread.sleep(poll_ns);
+            std_compat.thread.sleep(poll_ns);
         }
 
         log.info("tracker shutting down, killing subprocesses", .{});
@@ -1097,7 +1098,7 @@ pub const Tracker = struct {
                         _ = workspace_mod.runHook(tick_alloc, hook, task.workspace_path, @as(u64, self.cfg.workspace.hook_timeout_ms)) catch {};
                     }
                     // Remove workspace (will be recreated on next claim)
-                    std.fs.cwd().deleteTree(task.workspace_path) catch |err| {
+                    std_compat.fs.cwd().deleteTree(task.workspace_path) catch |err| {
                         log.warn("workspace: failed to remove {s}: {}", .{ task.workspace_path, err });
                     };
 

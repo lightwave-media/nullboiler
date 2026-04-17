@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.store);
 const ids = @import("ids.zig");
 const types = @import("types.zig");
@@ -1901,7 +1902,7 @@ test "Store: reopens legacy schema with user_version reset to zero" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
     const db_path = try std.fs.path.join(allocator, &.{ root, "legacy.db" });
     defer allocator.free(db_path);

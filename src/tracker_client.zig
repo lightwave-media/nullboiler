@@ -1,5 +1,6 @@
 /// HTTP client for NullTickets API used by the pull-mode tracker runtime.
 const std = @import("std");
+const std_compat = @import("compat.zig");
 
 pub const TransitionInfo = struct {
     trigger: []const u8 = "",
@@ -287,10 +288,10 @@ pub const TrackerClient = struct {
         body: ?[]const u8,
         bearer_override: ?[]const u8,
     ) !HttpResult {
-        var client: std.http.Client = .{ .allocator = self.allocator };
+        var client: std.http.Client = .{ .allocator = self.allocator, .io = std_compat.io() };
         defer client.deinit();
 
-        var response_body: std.io.Writer.Allocating = .init(self.allocator);
+        var response_body: std.Io.Writer.Allocating = .init(self.allocator);
         defer response_body.deinit();
 
         const token = bearer_override orelse self.api_token;
@@ -340,7 +341,8 @@ fn encodePathSegment(allocator: std.mem.Allocator, value: []const u8) ![]const u
             try buf.append(allocator, ch);
             continue;
         }
-        try buf.writer(allocator).print("%{X:0>2}", .{ch});
+        const upper = "0123456789ABCDEF";
+        try buf.appendSlice(allocator, &.{ '%', upper[(ch >> 4) & 0x0F], upper[ch & 0x0F] });
     }
 
     return try buf.toOwnedSlice(allocator);

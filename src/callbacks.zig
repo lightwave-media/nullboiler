@@ -5,6 +5,7 @@
 ///
 /// Callbacks are fire-and-forget: errors are logged but never propagated.
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.callbacks);
 const ids = @import("ids.zig");
 const metrics_mod = @import("metrics.zig");
@@ -137,7 +138,7 @@ fn appendCustomHeaders(allocator: std.mem.Allocator, cb_obj: std.json.ObjectMap,
 
 /// Internal: POST payload to a URL with custom headers. Fire-and-forget.
 fn postCallback(allocator: std.mem.Allocator, url: []const u8, payload: []const u8, custom_headers: []const std.http.Header) bool {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     _ = client.fetch(.{

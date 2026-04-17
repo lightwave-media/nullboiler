@@ -12,7 +12,7 @@ const json = std.json;
 
 /// Serialize a std.json.Value to an allocated JSON string.
 fn serializeValue(alloc: Allocator, value: json.Value) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     var jw: json.Stringify = .{ .writer = &out.writer };
     try jw.write(value);
     return try out.toOwnedSlice();
@@ -95,19 +95,19 @@ pub fn applyUpdates(alloc: Allocator, state_json: []const u8, updates_json: []co
     const arena_alloc = arena.allocator();
 
     const state_parsed = try json.parseFromSlice(json.Value, arena_alloc, state_json, .{});
-    const state_obj = if (state_parsed.value == .object) state_parsed.value.object else json.ObjectMap.init(arena_alloc);
+    const state_obj: json.ObjectMap = if (state_parsed.value == .object) state_parsed.value.object else .empty;
 
     const updates_parsed = try json.parseFromSlice(json.Value, arena_alloc, updates_json, .{});
     if (updates_parsed.value != .object) return try alloc.dupe(u8, state_json);
 
     const schema_parsed = try json.parseFromSlice(json.Value, arena_alloc, schema_json, .{});
-    const schema_obj = if (schema_parsed.value == .object) schema_parsed.value.object else json.ObjectMap.init(arena_alloc);
+    const schema_obj: json.ObjectMap = if (schema_parsed.value == .object) schema_parsed.value.object else .empty;
 
     // Start with a copy of all existing state keys
-    var result_obj = json.ObjectMap.init(arena_alloc);
+    var result_obj: json.ObjectMap = .empty;
     var state_it = state_obj.iterator();
     while (state_it.next()) |entry| {
-        try result_obj.put(entry.key_ptr.*, entry.value_ptr.*);
+        try result_obj.put(arena_alloc, entry.key_ptr.*, entry.value_ptr.*);
     }
 
     // For each update key, apply the reducer (with overwrite bypass, Gap 5)
@@ -119,7 +119,7 @@ pub fn applyUpdates(alloc: Allocator, state_json: []const u8, updates_json: []co
         // Gap 5: Check for overwrite bypass
         if (isOverwrite(update_value)) {
             const raw_val = extractOverwriteValue(update_value);
-            try result_obj.put(key, raw_val);
+            try result_obj.put(arena_alloc, key, raw_val);
             continue;
         }
 
@@ -153,7 +153,7 @@ pub fn applyUpdates(alloc: Allocator, state_json: []const u8, updates_json: []co
 
         // Parse the result back into a json.Value and put in result
         const new_parsed = try json.parseFromSlice(json.Value, arena_alloc, new_str, .{});
-        try result_obj.put(key, new_parsed.value);
+        try result_obj.put(arena_alloc, key, new_parsed.value);
     }
 
     // Serialize the result into the caller's allocator
@@ -171,12 +171,12 @@ pub fn initState(alloc: Allocator, input_json: []const u8, schema_json: []const 
     const arena_alloc = arena.allocator();
 
     const input_parsed = try json.parseFromSlice(json.Value, arena_alloc, input_json, .{});
-    const input_obj = if (input_parsed.value == .object) input_parsed.value.object else json.ObjectMap.init(arena_alloc);
+    const input_obj: json.ObjectMap = if (input_parsed.value == .object) input_parsed.value.object else .empty;
 
     const schema_parsed = try json.parseFromSlice(json.Value, arena_alloc, schema_json, .{});
     if (schema_parsed.value != .object) return try alloc.dupe(u8, input_json);
 
-    var result_obj = json.ObjectMap.init(arena_alloc);
+    var result_obj: json.ObjectMap = .empty;
 
     var schema_it = schema_parsed.value.object.iterator();
     while (schema_it.next()) |entry| {
@@ -184,7 +184,7 @@ pub fn initState(alloc: Allocator, input_json: []const u8, schema_json: []const 
         const schema_entry = entry.value_ptr.*;
 
         if (input_obj.get(key)) |input_val| {
-            try result_obj.put(key, input_val);
+            try result_obj.put(arena_alloc, key, input_val);
         } else {
             const type_str = blk: {
                 if (schema_entry == .object) {
@@ -206,11 +206,11 @@ pub fn initState(alloc: Allocator, input_json: []const u8, schema_json: []const 
             else if (std.mem.eql(u8, type_str, "boolean"))
                 .{ .bool = false }
             else if (std.mem.eql(u8, type_str, "object"))
-                .{ .object = json.ObjectMap.init(arena_alloc) }
+                .{ .object = .empty }
             else
                 .null;
 
-            try result_obj.put(key, default_val);
+            try result_obj.put(arena_alloc, key, default_val);
         }
     }
 
@@ -397,12 +397,12 @@ fn deepMerge(alloc: Allocator, base: json.Value, overlay: json.Value) !json.Valu
         return overlay;
     }
 
-    var result = json.ObjectMap.init(alloc);
+    var result: json.ObjectMap = .empty;
 
     // Copy all base keys
     var base_it = base.object.iterator();
     while (base_it.next()) |entry| {
-        try result.put(entry.key_ptr.*, entry.value_ptr.*);
+        try result.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
     }
 
     // Apply overlay keys, recursively merging nested objects
@@ -414,12 +414,12 @@ fn deepMerge(alloc: Allocator, base: json.Value, overlay: json.Value) !json.Valu
         if (result.get(key)) |existing| {
             if (existing == .object and overlay_val == .object) {
                 const merged = try deepMerge(alloc, existing, overlay_val);
-                try result.put(key, merged);
+                try result.put(alloc, key, merged);
             } else {
-                try result.put(key, overlay_val);
+                try result.put(alloc, key, overlay_val);
             }
         } else {
-            try result.put(key, overlay_val);
+            try result.put(alloc, key, overlay_val);
         }
     }
 
@@ -577,13 +577,13 @@ fn applyAddMessages(alloc: Allocator, old_json: ?[]const u8, update_json: []cons
             }
         } else {
             // No id — generate one and append
-            var msg_copy = json.ObjectMap.init(arena_alloc);
+            var msg_copy: json.ObjectMap = .empty;
             var it = msg.object.iterator();
             while (it.next()) |entry| {
-                try msg_copy.put(entry.key_ptr.*, entry.value_ptr.*);
+                try msg_copy.put(arena_alloc, entry.key_ptr.*, entry.value_ptr.*);
             }
             const gen_id = try std.fmt.allocPrint(arena_alloc, "msg_{d}", .{result_msgs.items.len});
-            try msg_copy.put("id", json.Value{ .string = gen_id });
+            try msg_copy.put(arena_alloc, "id", json.Value{ .string = gen_id });
             try result_msgs.append(json.Value{ .object = msg_copy });
         }
     }
@@ -625,11 +625,11 @@ pub fn stripEphemeralKeys(alloc: Allocator, state_json: []const u8, schema_json:
     const state_parsed = try json.parseFromSlice(json.Value, arena_alloc, state_json, .{});
     if (state_parsed.value != .object) return try alloc.dupe(u8, state_json);
 
-    var result_obj = json.ObjectMap.init(arena_alloc);
+    var result_obj: json.ObjectMap = .empty;
     var state_it = state_parsed.value.object.iterator();
     while (state_it.next()) |entry| {
         if (ephemeral_keys.get(entry.key_ptr.*) == null) {
-            try result_obj.put(entry.key_ptr.*, entry.value_ptr.*);
+            try result_obj.put(arena_alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 

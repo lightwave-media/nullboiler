@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat.zig");
 const config_mod = @import("config.zig");
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -109,7 +110,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (!builtin.is_test) {
-        const stdout = std.fs.File.stdout();
+        const stdout = std_compat.fs.File.stdout();
         try stdout.writeAll("{\"status\":\"ok\"}\n");
     }
 }
@@ -166,17 +167,14 @@ fn getU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
 
 fn ensureHome(home: []const u8) !void {
     if (std.fs.path.isAbsolute(home)) {
-        std.fs.makeDirAbsolute(home) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(home) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
         return;
     }
 
-    std.fs.cwd().makePath(home) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try std_compat.fs.cwd().makePath(home);
 }
 
 fn writeFileAtHome(allocator: std.mem.Allocator, home: []const u8, name: []const u8, contents: []const u8) !void {
@@ -185,14 +183,14 @@ fn writeFileAtHome(allocator: std.mem.Allocator, home: []const u8, name: []const
     try ensureParentDir(home, name);
 
     if (std.fs.path.isAbsolute(home)) {
-        const file = try std.fs.createFileAbsolute(path, .{});
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(contents);
         try file.writeAll("\n");
         return;
     }
 
-    const file = try std.fs.cwd().createFile(path, .{});
+    const file = try std_compat.fs.cwd().createFile(path, .{});
     defer file.close();
     try file.writeAll(contents);
     try file.writeAll("\n");
@@ -203,7 +201,7 @@ fn ensureParentDir(home: []const u8, name: []const u8) !void {
     if (std.fs.path.isAbsolute(home)) {
         const full_parent = try std.fs.path.join(std.heap.page_allocator, &.{ home, parent });
         defer std.heap.page_allocator.free(full_parent);
-        std.fs.makeDirAbsolute(full_parent) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(full_parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -212,10 +210,7 @@ fn ensureParentDir(home: []const u8, name: []const u8) !void {
 
     const full_parent = try std.fs.path.join(std.heap.page_allocator, &.{ home, parent });
     defer std.heap.page_allocator.free(full_parent);
-    std.fs.cwd().makePath(full_parent) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try std_compat.fs.cwd().makePath(full_parent);
 }
 
 fn defaultWorkflowFileName(allocator: std.mem.Allocator, pipeline_id: []const u8) ![]const u8 {
@@ -244,7 +239,7 @@ test "run writes tracker config and workflow with advanced settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(home);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -280,7 +275,7 @@ test "run writes tracker config and workflow with advanced settings" {
 
     const config_path = try std.fs.path.join(std.testing.allocator, &.{ home, "config.json" });
     defer std.testing.allocator.free(config_path);
-    const config_file = try std.fs.openFileAbsolute(config_path, .{});
+    const config_file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer config_file.close();
     const config_bytes = try config_file.readToEndAlloc(arena.allocator(), 64 * 1024);
 
@@ -342,7 +337,7 @@ test "run writes tracker config and workflow with advanced settings" {
 
     const workflow_path = try std.fs.path.join(std.testing.allocator, &.{ home, "workflows", "pipeline.dev.json" });
     defer std.testing.allocator.free(workflow_path);
-    const workflow_file = try std.fs.openFileAbsolute(workflow_path, .{});
+    const workflow_file = try std_compat.fs.openFileAbsolute(workflow_path, .{});
     defer workflow_file.close();
     const workflow_bytes = try workflow_file.readToEndAlloc(arena.allocator(), 16 * 1024);
 

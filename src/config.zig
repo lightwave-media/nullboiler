@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat.zig");
 
 pub const home_env_var = "NULLBOILER_HOME";
 pub const home_dir_name = ".nullboiler";
@@ -93,7 +94,7 @@ pub fn resolveConfigPath(allocator: std.mem.Allocator, override_path: ?[]const u
 }
 
 pub fn resolveHomeDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, home_env_var)) |env_home| {
+    if (std_compat.process.getEnvVarOwned(allocator, home_env_var)) |env_home| {
         return env_home;
     } else |err| switch (err) {
         error.EnvironmentVariableNotFound => {},
@@ -108,7 +109,7 @@ pub fn resolveHomeDir(allocator: std.mem.Allocator) ![]const u8 {
 /// Load configuration from a JSON file. If the file does not exist,
 /// return a default Config.
 pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const file = std_compat.fs.cwd().openFile(path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             return Config{};
         }
@@ -144,10 +145,10 @@ fn resolveRelativePath(allocator: std.mem.Allocator, config_path: []const u8, va
 }
 
 fn getHomeDirOwned(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+    return std_compat.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
             if (builtin.os.tag == .windows) {
-                return std.process.getEnvVarOwned(allocator, "USERPROFILE") catch error.HomeNotSet;
+                return std_compat.process.getEnvVarOwned(allocator, "USERPROFILE") catch error.HomeNotSet;
             }
             return error.HomeNotSet;
         },
@@ -205,12 +206,12 @@ test "loadFromFile reads configured host and worker URL from JSON file" {
         \\}
     ;
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "config.json",
         .data = cfg_json,
     });
 
-    const cfg_path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    const cfg_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "config.json");
     defer std.testing.allocator.free(cfg_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -258,7 +259,7 @@ test "resolveRelativePaths anchors tracker paths to config directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("configs");
+    try std_compat.fs.Dir.wrap(tmp.dir).makePath("configs");
     const cfg_json =
         \\{
         \\  "db": "data/nullboiler.db",
@@ -276,12 +277,12 @@ test "resolveRelativePaths anchors tracker paths to config directory" {
         \\}
     ;
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "configs/config.json",
         .data = cfg_json,
     });
 
-    const cfg_path = try tmp.dir.realpathAlloc(std.testing.allocator, "configs/config.json");
+    const cfg_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "configs/config.json");
     defer std.testing.allocator.free(cfg_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

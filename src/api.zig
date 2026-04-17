@@ -432,7 +432,7 @@ fn handleRegisterWorker(ctx: *Context, body: []const u8) HttpResponse {
                 return jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"tags must be an array of strings\"}}");
             }
         }
-        var out: std.io.Writer.Allocating = .init(ctx.allocator);
+        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
         var jw: std.json.Stringify = .{ .writer = &out.writer };
         jw.write(tags_val) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"failed to serialize tags\"}}");
         break :blk out.toOwnedSlice() catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
@@ -1943,7 +1943,7 @@ fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 fn serializeJsonValue(allocator: std.mem.Allocator, val: ?std.json.Value) ![]const u8 {
     const v = val orelse return "{}";
     if (v == .null) return "{}";
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
     try jw.write(v);
     return try out.toOwnedSlice();

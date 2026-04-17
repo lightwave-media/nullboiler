@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 
 pub fn run() !void {
     const manifest =
@@ -19,7 +20,7 @@ pub fn run() !void {
         \\    "aarch64-windows": { "asset": "nullboiler-windows-aarch64.exe", "binary": "nullboiler.exe" }
         \\  },
         \\  "build_from_source": {
-        \\    "zig_version": "0.15.2",
+        \\    "zig_version": "0.16.0",
         \\    "command": "zig build -Doptimize=ReleaseSmall",
         \\    "output": "zig-out/bin/nullboiler"
         \\  },
@@ -56,7 +57,7 @@ pub fn run() !void {
         \\  ]
         \\}
     ;
-    const stdout = std.fs.File.stdout();
+    const stdout = std_compat.fs.File.stdout();
     try stdout.writeAll(manifest);
     try stdout.writeAll("\n");
 }
