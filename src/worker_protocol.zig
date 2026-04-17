@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 
 pub const Protocol = enum {
     webhook,
@@ -45,7 +46,7 @@ pub fn buildRequestUrl(
     worker_url: []const u8,
     protocol: Protocol,
 ) ![]const u8 {
-    const trimmed = std.mem.trimRight(u8, worker_url, "/");
+    const trimmed = std_compat.mem.trimRight(u8, worker_url, "/");
     if (requiresExplicitPath(protocol) and !hasExplicitPath(trimmed)) {
         return error.WebhookUrlPathRequired;
     }
@@ -56,7 +57,7 @@ pub fn buildRequestUrl(
 }
 
 pub fn hasExplicitPath(url: []const u8) bool {
-    const trimmed = std.mem.trimRight(u8, url, "/");
+    const trimmed = std_compat.mem.trimRight(u8, url, "/");
     if (std.mem.startsWith(u8, trimmed, "/")) return true;
 
     const scheme_idx = std.mem.indexOf(u8, trimmed, "://") orelse return false;

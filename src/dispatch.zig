@@ -2,6 +2,7 @@
 /// Provides worker selection (filtering by status, capacity, and tags) and
 /// request/response adapters for webhook/api_chat/openai_chat protocols.
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const ids = @import("ids.zig");
 const worker_protocol = @import("worker_protocol.zig");
 const worker_response = @import("worker_response.zig");
@@ -191,10 +192,10 @@ pub fn dispatchStepWithOpts(
     }
     defer if (auth_header) |ah| allocator.free(ah);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
-    var response_body: std.io.Writer.Allocating = .init(allocator);
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
     defer response_body.deinit();
 
     var headers_buf: [1]std.http.Header = undefined;
@@ -253,10 +254,10 @@ pub fn probeWorker(
     const url = worker_protocol.buildRequestUrl(allocator, worker_url, protocol) catch return false;
     defer allocator.free(url);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
-    var response_body: std.io.Writer.Allocating = .init(allocator);
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
     defer response_body.deinit();
 
     const result = client.fetch(.{

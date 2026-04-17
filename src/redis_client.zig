@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.redis_client);
 const c = @cImport(@cInclude("hiredis.h"));
 const async_dispatch = @import("async_dispatch.zig");
@@ -55,7 +56,7 @@ pub fn runListener(
     _ = configs;
 
     while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        std_compat.thread.sleep(100 * std.time.ns_per_ms);
     }
     log.info("redis listener stopped", .{});
 }

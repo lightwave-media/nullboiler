@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const ids = @import("ids.zig");
 const Store = @import("store.zig").Store;
 const log = std.log.scoped(.workflow_loader);
@@ -54,9 +55,9 @@ pub const WorkflowMap = std.StringArrayHashMapUnmanaged(WorkflowDef);
 pub fn loadWorkflows(allocator: std.mem.Allocator, dir_path: []const u8) WorkflowMap {
     var map = WorkflowMap{};
     var dir = if (std.fs.path.isAbsolute(dir_path))
-        std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return map
+        std_compat.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return map
     else
-        std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return map;
+        std_compat.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return map;
     defer dir.close();
 
     var iter = dir.iterate();
@@ -80,7 +81,7 @@ test "loadWorkflows: supports absolute workflow directories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "current.json",
         .data =
         \\{
@@ -92,7 +93,7 @@ test "loadWorkflows: supports absolute workflow directories" {
         ,
     });
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -137,9 +138,9 @@ pub const WorkflowWatcher = struct {
         self.last_check_ms = now;
 
         var dir = if (std.fs.path.isAbsolute(self.dir_path))
-            std.fs.openDirAbsolute(self.dir_path, .{ .iterate = true }) catch return
+            std_compat.fs.openDirAbsolute(self.dir_path, .{ .iterate = true }) catch return
         else
-            std.fs.cwd().openDir(self.dir_path, .{ .iterate = true }) catch return;
+            std_compat.fs.cwd().openDir(self.dir_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
@@ -242,7 +243,7 @@ test "loadWorkflows: loads JSON files from directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "code_review.json",
         .data =
         \\{
@@ -262,7 +263,7 @@ test "loadWorkflows: loads JSON files from directory" {
         ,
     });
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "deploy.json",
         .data =
         \\{
@@ -279,12 +280,12 @@ test "loadWorkflows: loads JSON files from directory" {
     });
 
     // Non-json file should be ignored
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "readme.txt",
         .data = "not json",
     });
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -313,14 +314,14 @@ test "loadWorkflows: skips files with empty pipeline_id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "no_pipeline.json",
         .data =
         \\{"id": "wf-nope", "pipeline_id": ""}
         ,
     });
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -407,7 +408,7 @@ test "WorkflowWatcher: detects file changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(dir_path);
 
     var watcher = WorkflowWatcher.init(allocator, dir_path, &s);
@@ -417,7 +418,7 @@ test "WorkflowWatcher: detects file changes" {
     watcher.last_check_ms = 0;
 
     // Write a workflow file
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "test_wf.json",
         .data =
         \\{"id":"wf-test","name":"Test WF","nodes":{}}

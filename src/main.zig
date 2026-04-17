@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const std_compat = @import("compat.zig");
 const Store = @import("store.zig").Store;
 const api = @import("api.zig");
 const config = @import("config.zig");
@@ -27,22 +29,13 @@ fn onSignal(sig: c_int) callconv(.c) void {
     shutdown_requested.store(true, .seq_cst);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    std_compat.initProcess(init);
+    const allocator = std.heap.smp_allocator;
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.next(); // skip program name
-
-    // Collect all args into a slice for manifest protocol checks
-    var arg_list: std.ArrayListUnmanaged([:0]const u8) = .empty;
-    defer arg_list.deinit(allocator);
-    while (args.next()) |a| {
-        try arg_list.append(allocator, a);
-    }
-    const all_args = arg_list.items;
+    const args = try std_compat.process.argsAlloc(allocator);
+    defer std_compat.process.argsFree(allocator, args);
+    const all_args = if (args.len > 0) args[1..] else &.{};
 
     // Check for manifest protocol flags first (early exit, no config needed)
     if (all_args.len >= 1) {
@@ -228,15 +221,15 @@ pub fn main() !void {
         }
     }
 
-    const addr = std.net.Address.resolveIp(bind_host, port) catch |err| {
+    const addr = std.Io.net.IpAddress.resolve(std_compat.io(), bind_host, port) catch |err| {
         std.debug.print("failed to resolve bind address {s}:{d}: {}\n", .{ bind_host, port, err });
         return;
     };
-    var server = addr.listen(.{ .reuse_address = true }) catch |err| {
+    var server = addr.listen(std_compat.io(), .{ .reuse_address = true }) catch |err| {
         std.debug.print("failed to listen on {s}:{d}: {}\n", .{ bind_host, port, err });
         return;
     };
-    defer server.deinit();
+    defer server.deinit(std_compat.io());
 
     // SIGINT/SIGTERM should switch process into drain/shutdown mode.
     _ = c.signal(c.SIGINT, onSignal);
@@ -367,30 +360,32 @@ pub fn main() !void {
             break;
         }
 
-        var poll_fds = [_]std.posix.pollfd{
-            .{
-                .fd = server.stream.handle,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        const ready = std.posix.poll(&poll_fds, 50) catch {
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-            continue;
-        };
-        if (ready == 0) continue;
+        if (builtin.os.tag != .windows) {
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = server.socket.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+            const ready = std.posix.poll(&poll_fds, 50) catch {
+                std_compat.thread.sleep(50 * std.time.ns_per_ms);
+                continue;
+            };
+            if (ready == 0) continue;
+        }
 
-        var conn = server.accept() catch |err| {
+        var conn = server.accept(std_compat.io()) catch |err| {
             std.debug.print("accept error: {}\n", .{err});
             continue;
         };
-        defer conn.stream.close();
+        defer conn.close(std_compat.io());
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const req_alloc = arena.allocator();
 
-        const request = readHttpRequest(req_alloc, &conn.stream, max_request_size) catch |err| {
+        const request = readHttpRequest(req_alloc, &conn, max_request_size) catch |err| {
             std.debug.print("request read error: {}\n", .{err});
             continue;
         } orelse continue;
@@ -415,8 +410,11 @@ pub fn main() !void {
 
         const header = std.fmt.allocPrint(req_alloc, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nX-Request-Id: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ response.status, response.content_type, request.request_id, response.body.len }) catch continue;
 
-        conn.stream.writeAll(header) catch continue;
-        conn.stream.writeAll(response.body) catch continue;
+        var write_buffer: [4096]u8 = undefined;
+        var writer = conn.writer(std_compat.io(), &write_buffer);
+        writer.interface.writeAll(header) catch continue;
+        writer.interface.writeAll(response.body) catch continue;
+        writer.interface.flush() catch continue;
     }
 
     const drain_deadline = ids.nowMs() + @as(i64, @intCast(cfg.engine.shutdown_grace_ms));
@@ -425,7 +423,7 @@ pub fn main() !void {
         defer drain_arena.deinit();
         const active = store.getActiveRuns(drain_arena.allocator()) catch break;
         if (active.len == 0) break;
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        std_compat.thread.sleep(200 * std.time.ns_per_ms);
     }
 }
 
@@ -436,17 +434,14 @@ fn ensureParentDirForFile(path: []const u8) !void {
     if (parent.len == 0) return;
 
     if (std.fs.path.isAbsolute(parent)) {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
         return;
     }
 
-    std.fs.cwd().makePath(parent) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try std_compat.fs.cwd().makePath(parent);
 }
 
 fn serializeTagsJson(allocator: std.mem.Allocator, tags: []const []const u8) ![]const u8 {
@@ -463,16 +458,18 @@ const ParsedHttpRequest = struct {
     traceparent: ?[]const u8,
 };
 
-fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream, max_bytes: usize) !?ParsedHttpRequest {
+fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max_bytes: usize) !?ParsedHttpRequest {
     var buffer: std.ArrayListUnmanaged(u8) = .empty;
     defer buffer.deinit(allocator);
 
     var header_end: ?usize = null;
     var content_len: usize = 0;
+    var read_buffer: [request_read_chunk]u8 = undefined;
+    var reader = stream.reader(std_compat.io(), &read_buffer);
     var chunk: [request_read_chunk]u8 = undefined;
 
     while (true) {
-        const n = try stream.read(&chunk);
+        const n = try reader.interface.readSliceShort(&chunk);
         if (n == 0) return null;
 
         try buffer.appendSlice(allocator, chunk[0..n]);

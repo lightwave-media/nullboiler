@@ -1,6 +1,7 @@
 /// NullClaw subprocess manager — spawns, health-checks, and kills agent child processes.
 /// Used in pull-mode execution where NullBoiler spawns NullClaw as a child process per task.
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const ids = @import("ids.zig");
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -32,7 +33,7 @@ pub const SubprocessInfo = struct {
     pipeline_id: []const u8,
     agent_role: []const u8,
     port: u16,
-    child: ?std.process.Child,
+    child: ?std_compat.process.Child,
     current_turn: u32,
     max_turns: u32,
     started_at_ms: i64,
@@ -56,7 +57,7 @@ pub fn spawnNullClaw(
     args: []const []const u8,
     port: u16,
     workspace_path: []const u8,
-) !std.process.Child {
+) !std_compat.process.Child {
     // Build full argv: command + args + --port + port_str + --workdir + workspace_path
     const total_len = 1 + args.len + 4;
     const argv = try allocator.alloc([]const u8, total_len);
@@ -74,7 +75,7 @@ pub fn spawnNullClaw(
     argv[1 + args.len + 2] = "--workdir";
     argv[1 + args.len + 3] = workspace_path;
 
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     child.cwd = workspace_path;
@@ -98,13 +99,13 @@ pub fn waitForHealth(
     var attempt: u32 = 0;
     while (attempt < max_retries) : (attempt += 1) {
         if (attempt > 0) {
-            std.Thread.sleep(500 * std.time.ns_per_ms);
+            std_compat.thread.sleep(500 * std.time.ns_per_ms);
         }
 
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
         defer client.deinit();
 
-        var response_body: std.io.Writer.Allocating = .init(allocator);
+        var response_body: std.Io.Writer.Allocating = .init(allocator);
         defer response_body.deinit();
 
         const result = client.fetch(.{
@@ -138,10 +139,10 @@ pub fn sendPrompt(
     }, .{});
     defer allocator.free(body);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
-    var response_body: std.io.Writer.Allocating = .init(allocator);
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
     defer response_body.deinit();
 
     const result = client.fetch(.{
@@ -167,7 +168,7 @@ pub fn sendPrompt(
 // ── Kill ──────────────────────────────────────────────────────────────
 
 /// Kill a subprocess and wait for it to exit. Errors are silently ignored.
-pub fn killSubprocess(child: *std.process.Child) void {
+pub fn killSubprocess(child: *std_compat.process.Child) void {
     _ = child.kill() catch null;
     _ = child.wait() catch null;
 }

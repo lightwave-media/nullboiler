@@ -1,9 +1,10 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 
 /// Generate a UUID v4 string (36 chars: 8-4-4-4-12)
 pub fn generateId() [36]u8 {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    std_compat.crypto.random.bytes(&bytes);
 
     // Set version 4
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -27,5 +28,5 @@ pub fn generateId() [36]u8 {
 
 /// Current time in milliseconds since epoch
 pub fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    return std_compat.time.milliTimestamp();
 }

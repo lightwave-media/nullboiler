@@ -4,7 +4,7 @@ Graph-based workflow orchestrator with unified state model for NullClaw AI bot a
 
 ## Tech Stack
 
-- **Language**: Zig 0.15.2
+- **Language**: Zig 0.16.0
 - **Database**: SQLite (vendored in `deps/sqlite/`), WAL mode
 - **Protocol**: HTTP/1.1 REST API with JSON payloads
 - **Dispatch**: HTTP (webhook/api_chat/openai_chat/a2a), MQTT, Redis Streams

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.mqtt_client);
 const c = @cImport(@cInclude("mosquitto.h"));
 const async_dispatch = @import("async_dispatch.zig");
@@ -66,7 +67,7 @@ pub fn runListener(
     _ = configs;
 
     while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        std_compat.thread.sleep(100 * std.time.ns_per_ms);
     }
     log.info("mqtt listener stopped", .{});
 }

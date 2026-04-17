@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -27,7 +28,7 @@ pub const StrategyError = error{
 pub fn loadStrategies(allocator: std.mem.Allocator, dir_path: []const u8) StrategyMap {
     var map = StrategyMap{};
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+    var dir = std_compat.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
         return map;
     };
     defer dir.close();
@@ -125,23 +126,23 @@ fn expandStepNested(
 
     // Build a new step object: copy all fields except strategy/steps,
     // set type=sub_workflow, add workflow object with expanded steps
-    var new_obj = std.json.ObjectMap.init(allocator);
+    var new_obj: std.json.ObjectMap = .empty;
 
     // Copy existing fields
     for (step_obj.keys(), step_obj.values()) |key, val| {
         if (std.mem.eql(u8, key, "strategy")) continue;
         if (std.mem.eql(u8, key, "steps")) continue;
-        new_obj.put(key, val) catch return StrategyError.OutOfMemory;
+        new_obj.put(allocator, key, val) catch return StrategyError.OutOfMemory;
     }
 
     // Override type to sub_workflow
-    new_obj.put("type", std.json.Value{ .string = "sub_workflow" }) catch
+    new_obj.put(allocator, "type", std.json.Value{ .string = "sub_workflow" }) catch
         return StrategyError.OutOfMemory;
 
     // Build workflow object with expanded steps
-    var workflow_obj = std.json.ObjectMap.init(allocator);
-    workflow_obj.put("steps", nested_steps) catch return StrategyError.OutOfMemory;
-    new_obj.put("workflow", std.json.Value{ .object = workflow_obj }) catch
+    var workflow_obj: std.json.ObjectMap = .empty;
+    workflow_obj.put(allocator, "steps", nested_steps) catch return StrategyError.OutOfMemory;
+    new_obj.put(allocator, "workflow", std.json.Value{ .object = workflow_obj }) catch
         return StrategyError.OutOfMemory;
 
     return std.json.Value{ .object = new_obj };
@@ -162,7 +163,7 @@ fn applyChain(allocator: std.mem.Allocator, steps: []std.json.Value) !void {
         var deps = try std.json.Array.initCapacity(allocator, 1);
         try deps.append(std.json.Value{ .string = prev_id_val.string });
 
-        try step_val.object.put("depends_on", std.json.Value{ .array = deps });
+        try step_val.object.put(allocator, "depends_on", std.json.Value{ .array = deps });
     }
 }
 
@@ -172,19 +173,19 @@ fn buildReduceStep(
     reduce_obj: std.json.ObjectMap,
     steps: []const std.json.Value,
 ) !std.json.Value {
-    var new_obj = std.json.ObjectMap.init(allocator);
+    var new_obj: std.json.ObjectMap = .empty;
 
     // Copy all fields from the reduce config
     for (reduce_obj.keys(), reduce_obj.values()) |key, val| {
-        try new_obj.put(key, val);
+        try new_obj.put(allocator, key, val);
     }
 
     // Set type to reduce
-    try new_obj.put("type", std.json.Value{ .string = "reduce" });
+    try new_obj.put(allocator, "type", std.json.Value{ .string = "reduce" });
 
     // Ensure it has an id; default to "__reduce" if not provided
     if (new_obj.get("id") == null) {
-        try new_obj.put("id", std.json.Value{ .string = "__reduce" });
+        try new_obj.put(allocator, "id", std.json.Value{ .string = "__reduce" });
     }
 
     // Build depends_on array from all step ids
@@ -196,7 +197,7 @@ fn buildReduceStep(
         try deps.append(std.json.Value{ .string = id_val.string });
     }
 
-    try new_obj.put("depends_on", std.json.Value{ .array = deps });
+    try new_obj.put(allocator, "depends_on", std.json.Value{ .array = deps });
 
     return std.json.Value{ .object = new_obj };
 }
@@ -237,25 +238,25 @@ test "loadStrategies: loads from directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "mychain.json",
         .data =
         \\{"name":"mychain","description":"test chain","build":"chain"}
         ,
     });
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "mypar.json",
         .data =
         \\{"name":"mypar","description":"test parallel","build":"independent"}
         ,
     });
     // Non-json file should be ignored
-    try tmp.dir.writeFile(.{
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "readme.txt",
         .data = "not json",
     });
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir_path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

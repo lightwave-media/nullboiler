@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const Allocator = std.mem.Allocator;
 
 pub const StreamMode = enum {
@@ -38,7 +39,7 @@ pub const EventSnapshot = struct {
 pub const RunEventQueue = struct {
     events: std.ArrayListUnmanaged(SseEvent),
     alloc: Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     closed: std.atomic.Value(bool),
     next_seq: u64,
 
@@ -167,7 +168,7 @@ pub const RunEventQueue = struct {
 /// Central hub managing per-run event queues.
 pub const SseHub = struct {
     queues: std.StringHashMap(*RunEventQueue),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     alloc: Allocator,
 
     pub fn init(alloc: Allocator) SseHub {

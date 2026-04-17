@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat.zig");
 const log = std.log.scoped(.async_dispatch);
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -17,7 +18,7 @@ pub const AsyncResponse = struct {
 pub const ResponseQueue = struct {
     allocator: std.mem.Allocator,
     map: std.StringArrayHashMapUnmanaged(AsyncResponse),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) ResponseQueue {
         return .{
