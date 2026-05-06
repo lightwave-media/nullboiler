@@ -47,6 +47,23 @@ pub fn main(init: std.process.Init) !void {
             try @import("from_json.zig").run(allocator, all_args[1..]);
             return;
         }
+        if (std.mem.eql(u8, all_args[0], "help") or
+            std.mem.eql(u8, all_args[0], "--help") or
+            std.mem.eql(u8, all_args[0], "-h"))
+        {
+            printUsage();
+            return;
+        }
+        if (std.mem.eql(u8, all_args[0], "validate-workflows")) {
+            if (all_args.len > 2) {
+                std.debug.print("error: validate-workflows accepts at most one PATH argument\n\n", .{});
+                printUsage();
+                std.process.exit(2);
+            }
+            const workflow_dir = if (all_args.len == 2) all_args[1] else "workflows";
+            try runValidateWorkflows(allocator, workflow_dir);
+            return;
+        }
     }
 
     var host_override: ?[]const u8 = null;
@@ -424,6 +441,64 @@ pub fn main(init: std.process.Init) !void {
         const active = store.getActiveRuns(drain_arena.allocator()) catch break;
         if (active.len == 0) break;
         std_compat.thread.sleep(200 * std.time.ns_per_ms);
+    }
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\nullboiler v{s}
+        \\
+        \\Usage:
+        \\  nullboiler [--host HOST] [--port N] [--db PATH] [--config PATH] [--token TOKEN]
+        \\  nullboiler validate-workflows [PATH]
+        \\  nullboiler --export-manifest
+        \\  nullboiler --from-json '<wizard answers json>'
+        \\  nullboiler --version
+        \\
+        \\Commands:
+        \\  validate-workflows [PATH]  Preflight file-based tracker/pull-mode WorkflowDef JSON files.
+        \\
+    , .{version});
+}
+
+fn runValidateWorkflows(allocator: std.mem.Allocator, workflow_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try workflow_loader.validateWorkflowFiles(arena.allocator(), workflow_dir);
+
+    for (result.diagnostics) |diag| {
+        const level = switch (diag.severity) {
+            .@"error" => "ERROR",
+            .warning => "WARNING",
+        };
+        if (diag.field) |field| {
+            std.debug.print("{s} {s}: {s} ({s})\n", .{ level, diag.file_path, diag.message, field });
+        } else {
+            std.debug.print("{s} {s}: {s}\n", .{ level, diag.file_path, diag.message });
+        }
+    }
+
+    for (result.files) |file| {
+        if (!file.has_error and file.pipeline_id.len > 0) {
+            std.debug.print("OK {s} -> {s}\n", .{ file.file_path, file.pipeline_id });
+        }
+    }
+
+    std.debug.print(
+        "Checked {d} workflow files: {d} valid, {d} warning{s}, {d} error{s}\n",
+        .{
+            result.checked_files,
+            result.valid_files,
+            result.warning_count,
+            if (result.warning_count == 1) "" else "s",
+            result.error_count,
+            if (result.error_count == 1) "" else "s",
+        },
+    );
+
+    if (result.error_count > 0) {
+        std.process.exit(1);
     }
 }
 

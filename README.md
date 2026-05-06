@@ -92,3 +92,27 @@ state as `__config`.
 When `NULLBOILER_HOME` is set, `nullboiler` reads `config.json` from that directory and
 resolves relative paths like `db`, `strategies_dir`, `tracker.workflows_dir`, and
 `tracker.workspace.root` relative to that config file.
+
+## Workflow Preflight
+
+File-based tracker/pull-mode workflows are loaded from JSON files using the
+`WorkflowDef` shape in `src/workflow_loader.zig`. Before starting the server, you
+can check those files locally:
+
+```bash
+zig build run -- validate-workflows
+zig build run -- validate-workflows workflows
+```
+
+The command defaults to `workflows` and scans direct `*.json` files in the
+directory. It reports:
+
+- errors for missing or unreadable directories, unreadable files, malformed JSON,
+  JSON that cannot be parsed as `WorkflowDef`, missing or empty `pipeline_id`,
+  and duplicate `pipeline_id` values
+- warnings for suspicious but currently allowed shapes, including empty `id`,
+  empty `claim_roles`, dispatch workflows without `dispatch.worker_tags`, and
+  directories with no JSON workflow files
+
+Validation errors exit with status `1`. Warnings are shown but do not fail the
+command, matching the existing runtime loader's permissive behavior.
