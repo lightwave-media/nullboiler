@@ -122,7 +122,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
     // Do NOT free `contents` or deinit `parsed` here.
     // `Config` fields may point into these allocations.
     // The caller should provide an arena allocator and clean it up once on shutdown.
-    const parsed = try std.json.parseFromSlice(Config, allocator, contents, .{});
+    const parsed = try std.json.parseFromSlice(Config, allocator, contents, .{ .ignore_unknown_fields = true });
 
     return parsed.value;
 }
