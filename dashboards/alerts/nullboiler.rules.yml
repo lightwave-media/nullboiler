@@ -1,0 +1,204 @@
+# Prometheus AlertManager rules for NullBoiler.
+#
+# Drop into your Prometheus config alongside the scrape stanza from
+# `dashboards/prometheus/prometheus.yml`:
+#
+#   rule_files:
+#     - /etc/prometheus/alerts/nullboiler.rules.yml
+#
+# Then point AlertManager at the rules and route the `nullboiler` group
+# to your on-call channel.
+#
+# These rules pair 1:1 with the panels in `dashboards/grafana/`. If you
+# tune a threshold here, mirror it in the corresponding dashboard panel
+# threshold band so the dashboard and the alert tell the same story.
+
+groups:
+  - name: nullboiler.health
+    interval: 30s
+    rules:
+
+      # ── Liveness ──────────────────────────────────────────────────
+
+      - alert: NullBoilerInstanceDown
+        expr: up{job="nullboiler"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: nullboiler
+        annotations:
+          summary: "NullBoiler instance is down"
+          description: |
+            Prometheus has not scraped {{ $labels.instance }} for 2
+            minutes. Either the orchestrator process died or the
+            `/metrics` endpoint stopped responding.
+          runbook: "https://github.com/nullclaw/nullboiler/blob/main/dashboards/README.md"
+
+      # ── Worker dispatch (Gap 3 territory) ─────────────────────────
+
+      - alert: NullBoilerDispatchFailureRatioHigh
+        expr: |
+          (
+              rate(nullboiler_worker_dispatch_failure_total[5m])
+            /
+              clamp_min(
+                  rate(nullboiler_worker_dispatch_success_total[5m])
+                + rate(nullboiler_worker_dispatch_failure_total[5m]),
+                  0.001
+              )
+          ) > 0.30
+        for: 5m
+        labels:
+          severity: warning
+          service: nullboiler
+        annotations:
+          summary: "More than 30% of worker dispatches are failing (5m)"
+          description: |
+            Sustained dispatch failure ratio above 30% indicates a
+            broken contract between NullBoiler and at least one
+            worker. Cross-check the *Workers* dashboard's
+            "Failure ratios over time" panel: if `health-check
+            failure ratio` is also high, the worker is unreachable;
+            if only dispatch is failing, the worker is reachable but
+            its `/webhook` is returning the wrong shape (see
+            integration-analysis.md Gap 3).
+          dashboard: "http://grafana/d/nullboiler-workers"
+
+      - alert: NullBoilerDispatchFailureRatioCritical
+        expr: |
+          (
+              rate(nullboiler_worker_dispatch_failure_total[5m])
+            /
+              clamp_min(
+                  rate(nullboiler_worker_dispatch_success_total[5m])
+                + rate(nullboiler_worker_dispatch_failure_total[5m]),
+                  0.001
+              )
+          ) > 0.80
+        for: 2m
+        labels:
+          severity: critical
+          service: nullboiler
+        annotations:
+          summary: "Worker dispatches almost entirely failing (>80% for 2m)"
+          description: |
+            Effectively no work is reaching workers. Page on-call.
+
+      # ── Worker health probes ──────────────────────────────────────
+
+      - alert: NullBoilerWorkerHealthDegraded
+        expr: |
+          (
+              rate(nullboiler_worker_health_failures_total[5m])
+            /
+              clamp_min(
+                  rate(nullboiler_worker_health_checks_total[5m]),
+                  0.001
+              )
+          ) > 0.20
+        for: 5m
+        labels:
+          severity: warning
+          service: nullboiler
+        annotations:
+          summary: "Worker fleet health probes failing >20% (5m)"
+          description: |
+            At least one worker is failing health probes. Look at
+            `GET /workers` for `consecutive_failures > 0` and
+            `last_error_text` to localise.
+
+      # ── Run lifecycle webhooks ────────────────────────────────────
+
+      - alert: NullBoilerCallbackDeliveryDegraded
+        expr: |
+          (
+              rate(nullboiler_callback_failed_total[5m])
+            /
+              clamp_min(
+                  rate(nullboiler_callback_sent_total[5m])
+                + rate(nullboiler_callback_failed_total[5m]),
+                  0.001
+              )
+          ) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          service: nullboiler
+        annotations:
+          summary: "Run-lifecycle callbacks failing >10% (10m)"
+          description: |
+            Consumers depending on `step.completed` / `run.completed`
+            webhooks may be missing notifications. Check
+            `last_error_text` on the failing callback configs.
+
+      # ── Step retries (signal of upstream flake) ───────────────────
+
+      - alert: NullBoilerStepRetryRateElevated
+        expr: |
+          (
+              rate(nullboiler_steps_retry_scheduled_total[5m])
+            /
+              clamp_min(
+                  rate(nullboiler_steps_claimed_total[5m]),
+                  0.001
+              )
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: info
+          service: nullboiler
+        annotations:
+          summary: "More than 20% of steps are being retried (10m)"
+          description: |
+            High retry rate usually means transient errors at the
+            worker layer. Once retry policy gains exponential backoff
+            + jitter (reference/todo.md P1-01), this alert can be
+            tightened.
+
+  - name: nullboiler.flow
+    interval: 30s
+    rules:
+
+      # ── Throughput sanity ─────────────────────────────────────────
+
+      - alert: NullBoilerNoTrafficForExtendedPeriod
+        expr: |
+          (rate(nullboiler_http_requests_total[15m]) == 0)
+            or absent(nullboiler_http_requests_total)
+        for: 30m
+        labels:
+          severity: info
+          service: nullboiler
+        annotations:
+          summary: "NullBoiler has received no HTTP traffic for 30m"
+          description: |
+            The orchestrator is up but idle. Often benign (between
+            workloads); fires on a clearly-broken upstream pipeline.
+            Liveness itself is covered by NullBoilerInstanceDown — the
+            `absent()` clause here catches the edge case of a target
+            that never produced a sample (e.g. immediately after a
+            restart that bypassed the first scrape).
+
+      # ── Idempotency replays ───────────────────────────────────────
+
+      - alert: NullBoilerIdempotentReplayRatioVeryHigh
+        expr: |
+          (
+              rate(nullboiler_runs_idempotent_replays_total[15m])
+            /
+              clamp_min(
+                  rate(nullboiler_runs_created_total[15m])
+                + rate(nullboiler_runs_idempotent_replays_total[15m]),
+                  0.001
+              )
+          ) > 0.95
+        for: 15m
+        labels:
+          severity: info
+          service: nullboiler
+        annotations:
+          summary: "95%+ of POST /runs are idempotent replays (15m)"
+          description: |
+            A producer is hammering POST /runs with the same
+            idempotency key. This is harmless (replays are cheap) but
+            usually points to a misconfigured retry loop upstream.
