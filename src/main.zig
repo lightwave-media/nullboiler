@@ -464,12 +464,10 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
 
     var header_end: ?usize = null;
     var content_len: usize = 0;
-    var read_buffer: [request_read_chunk]u8 = undefined;
-    var reader = stream.reader(std_compat.io(), &read_buffer);
     var chunk: [request_read_chunk]u8 = undefined;
 
     while (true) {
-        const n = try reader.interface.readSliceShort(&chunk);
+        const n = std.posix.read(stream.socket.handle, &chunk) catch return error.ReadFailed;
         if (n == 0) return null;
 
         try buffer.appendSlice(allocator, chunk[0..n]);
