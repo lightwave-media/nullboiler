@@ -469,7 +469,11 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
     var chunk: [request_read_chunk]u8 = undefined;
 
     while (true) {
-        const n = try reader.interface.readSliceShort(&chunk);
+        var data: [1][]u8 = .{&chunk};
+        const n = reader.interface.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
         if (n == 0) return null;
 
         try buffer.appendSlice(allocator, chunk[0..n]);
