@@ -859,6 +859,40 @@ pub const Store = struct {
         return colInt(stmt, 0);
     }
 
+    pub fn countRunsInFlight(self: *Self) !i64 {
+        const sql = "SELECT COUNT(*) FROM runs WHERE status IN ('running', 'pending')";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
+    pub fn countStepsRunning(self: *Self) !i64 {
+        const sql = "SELECT COUNT(*) FROM steps WHERE status = 'running'";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
+    pub fn countWorkersByStatus(self: *Self, status: []const u8) !i64 {
+        const sql = "SELECT COUNT(*) FROM workers WHERE status = ?";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
     pub fn getChildSteps(self: *Self, allocator: std.mem.Allocator, parent_step_id: []const u8) ![]types.StepRow {
         const sql = "SELECT id, run_id, def_step_id, type, status, worker_id, input_json, output_json, error_text, attempt, max_attempts, timeout_ms, next_attempt_at_ms, parent_step_id, item_index, created_at_ms, updated_at_ms, started_at_ms, ended_at_ms, child_run_id, iteration_index FROM steps WHERE parent_step_id = ? ORDER BY item_index ASC";
         var stmt: ?*c.sqlite3_stmt = null;

@@ -17,7 +17,22 @@ pub const Metrics = struct {
         _ = counter.fetchAdd(1, .monotonic);
     }
 
+    /// Snapshot of live "right now" values, sampled from the source-of-truth
+    /// state at Prometheus scrape time (DB and the drain atomic). Sampled —
+    /// not maintained via inc/dec wiring across engine/store hot-paths —
+    /// because the gauge is then accurate by construction.
+    pub const Sample = struct {
+        runs_in_flight: i64 = 0,
+        steps_in_flight: i64 = 0,
+        workers_healthy: i64 = 0,
+        drain_mode: i64 = 0,
+    };
+
     pub fn renderPrometheus(self: *const Metrics, allocator: std.mem.Allocator) ![]const u8 {
+        return self.renderPrometheusWithSample(allocator, .{});
+    }
+
+    pub fn renderPrometheusWithSample(self: *const Metrics, allocator: std.mem.Allocator, sample: Sample) ![]const u8 {
         return std.fmt.allocPrint(
             allocator,
             \\# TYPE nullboiler_http_requests_total counter
@@ -42,6 +57,14 @@ pub const Metrics = struct {
             \\nullboiler_callback_sent_total {d}
             \\# TYPE nullboiler_callback_failed_total counter
             \\nullboiler_callback_failed_total {d}
+            \\# TYPE nullboiler_runs_in_flight gauge
+            \\nullboiler_runs_in_flight {d}
+            \\# TYPE nullboiler_steps_in_flight gauge
+            \\nullboiler_steps_in_flight {d}
+            \\# TYPE nullboiler_workers_healthy gauge
+            \\nullboiler_workers_healthy {d}
+            \\# TYPE nullboiler_drain_mode gauge
+            \\nullboiler_drain_mode {d}
             \\
         ,
             .{
@@ -56,6 +79,10 @@ pub const Metrics = struct {
                 self.worker_health_failures_total.load(.monotonic),
                 self.callback_sent_total.load(.monotonic),
                 self.callback_failed_total.load(.monotonic),
+                sample.runs_in_flight,
+                sample.steps_in_flight,
+                sample.workers_healthy,
+                sample.drain_mode,
             },
         );
     }

@@ -282,8 +282,25 @@ fn handleHealth(ctx: *Context) HttpResponse {
 
 fn handleMetrics(ctx: *Context) HttpResponse {
     const m = ctx.metrics orelse return plainResponse(200, "nullboiler_metrics_disabled 1\n");
-    const body = m.renderPrometheus(ctx.allocator) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
+    const sample = computeGaugeSample(ctx);
+    const body = m.renderPrometheusWithSample(ctx.allocator, sample) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
     return plainResponse(200, body);
+}
+
+/// Sample live "right now" values for the gauge metrics. Each helper falls
+/// back to 0 on error so a flaky DB query never poisons the entire /metrics
+/// response — the counter half stays valid.
+fn computeGaugeSample(ctx: *Context) metrics_mod.Metrics.Sample {
+    const drain_value: i64 = if (ctx.drain_mode) |d|
+        (if (d.load(.acquire)) @as(i64, 1) else @as(i64, 0))
+    else
+        0;
+    return .{
+        .runs_in_flight = ctx.store.countRunsInFlight() catch 0,
+        .steps_in_flight = ctx.store.countStepsRunning() catch 0,
+        .workers_healthy = ctx.store.countWorkersByStatus("active") catch 0,
+        .drain_mode = drain_value,
+    };
 }
 
 fn handleEnableDrain(ctx: *Context) HttpResponse {
