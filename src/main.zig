@@ -47,6 +47,23 @@ pub fn main(init: std.process.Init) !void {
             try @import("from_json.zig").run(allocator, all_args[1..]);
             return;
         }
+        if (std.mem.eql(u8, all_args[0], "help") or
+            std.mem.eql(u8, all_args[0], "--help") or
+            std.mem.eql(u8, all_args[0], "-h"))
+        {
+            printUsage();
+            return;
+        }
+        if (std.mem.eql(u8, all_args[0], "validate-workflows")) {
+            if (all_args.len > 2) {
+                std.debug.print("error: validate-workflows accepts at most one PATH argument\n\n", .{});
+                printUsage();
+                std.process.exit(2);
+            }
+            const workflow_dir = if (all_args.len == 2) all_args[1] else "workflows";
+            try runValidateWorkflows(allocator, workflow_dir);
+            return;
+        }
     }
 
     var host_override: ?[]const u8 = null;
@@ -427,6 +444,64 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn printUsage() void {
+    std.debug.print(
+        \\nullboiler v{s}
+        \\
+        \\Usage:
+        \\  nullboiler [--host HOST] [--port N] [--db PATH] [--config PATH] [--token TOKEN]
+        \\  nullboiler validate-workflows [PATH]
+        \\  nullboiler --export-manifest
+        \\  nullboiler --from-json '<wizard answers json>'
+        \\  nullboiler --version
+        \\
+        \\Commands:
+        \\  validate-workflows [PATH]  Preflight file-based tracker/pull-mode WorkflowDef JSON files.
+        \\
+    , .{version});
+}
+
+fn runValidateWorkflows(allocator: std.mem.Allocator, workflow_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try workflow_loader.validateWorkflowFiles(arena.allocator(), workflow_dir);
+
+    for (result.diagnostics) |diag| {
+        const level = switch (diag.severity) {
+            .@"error" => "ERROR",
+            .warning => "WARNING",
+        };
+        if (diag.field) |field| {
+            std.debug.print("{s} {s}: {s} ({s})\n", .{ level, diag.file_path, diag.message, field });
+        } else {
+            std.debug.print("{s} {s}: {s}\n", .{ level, diag.file_path, diag.message });
+        }
+    }
+
+    for (result.files) |file| {
+        if (!file.has_error and file.pipeline_id.len > 0) {
+            std.debug.print("OK {s} -> {s}\n", .{ file.file_path, file.pipeline_id });
+        }
+    }
+
+    std.debug.print(
+        "Checked {d} workflow files: {d} valid, {d} warning{s}, {d} error{s}\n",
+        .{
+            result.checked_files,
+            result.valid_files,
+            result.warning_count,
+            if (result.warning_count == 1) "" else "s",
+            result.error_count,
+            if (result.error_count == 1) "" else "s",
+        },
+    );
+
+    if (result.error_count > 0) {
+        std.process.exit(1);
+    }
+}
+
 fn ensureParentDirForFile(path: []const u8) !void {
     if (path.len == 0 or std.mem.eql(u8, path, ":memory:") or std.mem.startsWith(u8, path, "file:")) return;
 
@@ -464,16 +539,10 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
 
     var header_end: ?usize = null;
     var content_len: usize = 0;
-    var read_buffer: [request_read_chunk]u8 = undefined;
-    var reader = stream.reader(std_compat.io(), &read_buffer);
     var chunk: [request_read_chunk]u8 = undefined;
 
     while (true) {
-        var data: [1][]u8 = .{&chunk};
-        const n = reader.interface.readVec(&data) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => |e| return e,
-        };
+        const n = try readStreamAvailable(stream, &chunk);
         if (n == 0) return null;
 
         try buffer.appendSlice(allocator, chunk[0..n]);
@@ -522,6 +591,14 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
         .request_id = request_id,
         .traceparent = traceparent,
     };
+}
+
+fn readStreamAvailable(stream: *std.Io.net.Stream, buffer: []u8) std.Io.net.Stream.Reader.Error!usize {
+    // Reader.readSliceShort fills the whole buffer in Zig 0.16, which stalls
+    // small HTTP requests until the client closes the socket.
+    var slices = [_][]u8{buffer};
+    const io = std_compat.io();
+    return io.vtable.netRead(io.userdata, stream.socket.handle, &slices);
 }
 
 fn parseContentLength(headers_raw: []const u8) ?usize {
@@ -637,33 +714,17 @@ test "worker_protocol hasExplicitPath identifies explicit path URLs" {
     try std.testing.expect(worker_protocol.hasExplicitPath("http://localhost:3000/webhook"));
 }
 
-// Integration test: covers the accept-read-write loop in main.zig that previously
-// regressed when readSliceShort replaced one-shot semantics. The 340 unit tests
-// invoke api.handleRequest directly and would not catch a stall in the live HTTP
-// path.
-//
-// We bind a real loopback socket on a kernel-assigned port, connect a client
-// from the same thread, send a small HTTP request without ever closing the
-// write side, and call readHttpRequest on the accepted Stream. Pre-fix, this
-// would block until the client FIN'd or the kernel buffer filled — neither
-// happens here, so the test would hang. To make a regression fail loudly
-// instead of hanging, we set SO_RCVTIMEO on the server-side socket so the
-// reader returns an error within a small bound.
 test "readHttpRequest does not block when request is smaller than chunk" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const c_sys = std.posix.system;
 
-    // 1. Listen on 127.0.0.1:0
     const server_addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
     var server = try server_addr.listen(std_compat.io(), .{ .reuse_address = true });
     defer server.deinit(std_compat.io());
 
     const port = server.socket.address.ip4.port;
 
-    // 2. Plain libc client socket — single-threaded: kernel completes 3-way
-    //    handshake on connect against the listening socket, so accept on the
-    //    same thread returns immediately afterwards.
     const sock_rc = c_sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
     try std.testing.expect(sock_rc >= 0);
     const client_fd: std.posix.fd_t = @intCast(sock_rc);
@@ -677,32 +738,25 @@ test "readHttpRequest does not block when request is smaller than chunk" {
     const cr = c_sys.connect(client_fd, @ptrCast(&sin), @sizeOf(@TypeOf(sin)));
     try std.testing.expectEqual(@as(c_int, 0), cr);
 
-    // 3. accept on the server side. On the bug version, the read below would
-    //    block; the connection itself accepts fine.
     var conn = try server.accept(std_compat.io());
     defer conn.close(std_compat.io());
 
-    // 4. Set a 2 second receive timeout on the server-side socket. With the
-    //    fix, the read returns in <1 ms. With the regression, it would block
-    //    indefinitely; the timeout turns that into a clean failure rather
-    //    than a hung test.
+    // Convert a blocking read regression into a bounded test failure.
     const tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
-    _ = c_sys.setsockopt(
+    const timeout_rc = c_sys.setsockopt(
         conn.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         @ptrCast(&tv),
         @sizeOf(@TypeOf(tv)),
     );
+    try std.testing.expectEqual(@as(c_int, 0), timeout_rc);
 
-    // 5. Send the request from the client side. Crucially we do NOT shut down
-    //    the write side — there is no FIN, so a read that waits for EOF would
-    //    block forever (modulo the timeout above).
+    // Keep the write side open so reads waiting for EOF would stall.
     const req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    const sent = c_sys.send(client_fd, req.ptr, req.len, std.posix.MSG.NOSIGNAL);
+    const sent = c_sys.send(client_fd, req.ptr, req.len, 0);
     try std.testing.expectEqual(@as(isize, @intCast(req.len)), sent);
 
-    // 6. Time the read.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -714,9 +768,6 @@ test "readHttpRequest does not block when request is smaller than chunk" {
     try std.testing.expectEqualStrings("GET", parsed.?.method);
     try std.testing.expectEqualStrings("/health", parsed.?.target);
 
-    // The fix delivers single-syscall recv semantics. 200 ms is comfortably
-    // above any plausible loopback variance and far below the 2 s timeout
-    // and the ~5 s the regression would take to surface.
     try std.testing.expect(elapsed_ms < 200);
 }
 
