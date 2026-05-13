@@ -14,7 +14,7 @@ domain types from `src/types.zig`.
 |---|---|
 | Health, Metrics | `GET /health`, `GET /metrics` |
 | Runs | `POST /runs`, `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/{cancel,retry,resume,replay,state}`, `POST /runs/fork` |
-| Steps & Events | `GET /runs/{id}/steps`, `GET /runs/{id}/steps/{step_id}`, `GET /runs/{id}/events`, `GET /runs/{id}/stream` (SSE) |
+| Steps & Events | `GET /runs/{id}/steps`, `GET /runs/{id}/steps/{step_id}`, `GET /runs/{id}/events`, `GET /runs/{id}/stream` (JSON stream snapshot) |
 | Checkpoints | `GET /runs/{id}/checkpoints`, `GET /runs/{id}/checkpoints/{cp_id}` |
 | Workers | `POST /workers`, `GET /workers`, `DELETE /workers/{id}` |
 | Workflows | full CRUD on `/workflows`, plus `validate`, `mermaid`, `run` |
@@ -95,8 +95,9 @@ spec version per release tag.
   {"error": {"code": "<code>", "message": "<human readable>"}}
   ```
   See `ErrorDetail.code` for the closed enum of codes.
-- **Idempotency** — `POST /runs` and `POST /workflows/{id}/run` honor
-  `Idempotency-Key` (preferred) or `idempotency_key` body field.
+- **Idempotency** — `POST /runs` honors `Idempotency-Key` (preferred) or
+  `idempotency_key` body field. Stored-workflow launches via
+  `POST /workflows/{id}/run` do not currently implement idempotency.
 - **Auth** — bearer token; `/health` and `/metrics` are public so that
   load balancers and Prometheus scrapers can reach them without
   provisioning a token.
@@ -125,8 +126,8 @@ branch:
 - `src/api.zig` — route table (`handleRequest`) and per-handler bodies
 - `src/types.zig` — all enums and DB row types
 - `src/strategy.zig` — strategy expansion semantics
-- `src/workflow_loader.zig` — workflow JSON shape
-- `src/workflow_validation.zig` — validation rules
+- `src/workflow_validation.zig` and `src/engine.zig` — graph workflow shape
+  and validation rules
 - `src/metrics.zig` — Prometheus exposition (used in `/metrics` example)
 
 If you change one of those files, update this spec. CI does not yet

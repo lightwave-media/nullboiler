@@ -22,16 +22,11 @@ info:
 
     ## Endpoint availability
 
-    A few endpoints are conditional on configuration or build version:
+    A few endpoints are conditional on runtime configuration:
 
     - **`/tracker/*`** — only mounted when `tracker` is configured in
       `nullboiler.config.json`. Otherwise the orchestrator runs in
       tracker-less mode and these paths return `404`.
-    - **`/workflows/*`** and **`/rate-limits`** — present on `main`.
-      The published `ghcr.io/nullclaw/nullboiler:2026.3.2` image (built
-      from an earlier commit) returns `404` for them. They are
-      documented here because consumers targeting `main` or a future
-      release will see them.
 
     ## Authentication
 
@@ -81,7 +76,7 @@ tags:
   - name: Steps
     description: Individual step inspection within a run.
   - name: Events
-    description: Run-scoped event feed (polling and SSE streaming).
+    description: Run-scoped event feed and stream snapshots.
   - name: Checkpoints
     description: Run state snapshots used for resume, fork, and replay.
   - name: Workers
@@ -127,8 +122,7 @@ paths:
       summary: Prometheus metrics
       description: |
         Prometheus exposition format. Public (no auth) so that scrapers can
-        reach it without provisioning a token. See `dashboards/grafana/`
-        for ready-to-import dashboards.
+        reach it without provisioning a token.
       operationId: getMetrics
       security: []
       responses:
@@ -430,9 +424,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
+                $ref: '#/components/schemas/RunStatusResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -440,19 +436,21 @@ paths:
     post:
       tags: [Runs]
       summary: Retry a failed run
-      description: Creates a new run from the workflow snapshot of the failed run.
+      description: Resets failed steps to ready and moves the run back to `running`.
       operationId: retryRun
       parameters:
         - $ref: '#/components/parameters/RunId'
       responses:
-        '201':
-          description: Retry created
+        '200':
+          description: Run moved back to running
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunCreated'
+                $ref: '#/components/schemas/RunStatusResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -498,18 +496,10 @@ paths:
       tags: [Events]
       summary: List run events
       description: |
-        Polling-mode event feed. For continuous tailing, use
-        `GET /runs/{id}/stream` (SSE).
+        Polling-mode event feed backed by persisted run events.
       operationId: listRunEvents
       parameters:
         - $ref: '#/components/parameters/RunId'
-        - name: since
-          in: query
-          required: false
-          schema:
-            type: integer
-            format: int64
-          description: Only return events with `id` greater than this value.
       responses:
         '200':
           description: Array of events ordered by id ascending
@@ -519,30 +509,48 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Event'
-        '404':
-          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /runs/{id}/stream:
     get:
       tags: [Events]
-      summary: Stream run events via SSE
+      summary: Snapshot run stream events
       description: |
-        Server-Sent Events stream of run events. Clients should reconnect
-        with `Last-Event-ID` to resume after disconnects. Stream ends when
-        the run reaches a terminal status (completed, failed, cancelled).
+        Returns the current run status/state, persisted events, and buffered
+        in-memory stream events as a regular JSON response. Use `after_seq`
+        to page through buffered stream events without sharing cursor state
+        between consumers.
       operationId: streamRunEvents
       parameters:
         - $ref: '#/components/parameters/RunId'
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            example: values,debug
+          description: Comma-separated stream modes to include (`values`, `updates`, `tasks`, `debug`, `custom`). Defaults to all modes.
+        - name: after_seq
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+          description: Return buffered stream events after this sequence number.
       responses:
         '200':
-          description: SSE event stream
+          description: Stream snapshot
           content:
-            text/event-stream:
+            application/json:
               schema:
-                type: string
-                description: |
-                  SSE format: each event has `id:`, `event:`, `data:` lines.
-                  `data` is a JSON object with the same shape as `Event`.
+                $ref: '#/components/schemas/StreamSnapshot'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /runs/{id}/checkpoints:
     get:
@@ -584,36 +592,38 @@ paths:
   /runs/{id}/resume:
     post:
       tags: [Runs]
-      summary: Resume run from a checkpoint
+      summary: Resume an interrupted run
+      description: |
+        Resumes the latest checkpoint for a run currently in `interrupted`
+        status. Optional `state_updates` are applied before the run is moved
+        back to `running`.
       operationId: resumeRun
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
               type: object
-              required: [checkpoint_id]
               properties:
-                checkpoint_id:
-                  type: string
-                  description: Checkpoint to resume from.
-                state_overrides:
+                state_updates:
                   type: object
                   additionalProperties: true
-                  description: Optional state values to inject before resuming.
+                  description: Optional state values to merge before resuming.
       responses:
         '200':
           description: Run resumed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
-        '400':
-          $ref: '#/components/responses/BadRequest'
+                $ref: '#/components/schemas/RunStatusResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /runs/fork:
     post:
@@ -629,12 +639,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [parent_run_id, checkpoint_id]
+              required: [checkpoint_id]
               properties:
-                parent_run_id:
-                  type: string
                 checkpoint_id:
                   type: string
+                  description: Existing checkpoint to fork from; the parent run is inferred from this checkpoint.
                 state_overrides:
                   type: object
                   additionalProperties: true
@@ -644,11 +653,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunCreated'
+                $ref: '#/components/schemas/ForkRunResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /runs/{id}/state:
     post:
@@ -676,49 +687,58 @@ paths:
                   type: string
                   description: Optional def_step_id — defer until that step finishes.
       responses:
-        '202':
-          description: Injection queued
+        '200':
+          description: State update applied immediately or queued for a later step
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  queued: { type: boolean, enum: [true] }
-                  injection_id: { type: integer, format: int64 }
+                $ref: '#/components/schemas/StateInjectionResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /runs/{id}/replay:
     post:
       tags: [Runs]
-      summary: Replay a completed run
+      summary: Replay a run from a checkpoint
       description: |
-        Re-executes a run deterministically from its frozen workflow
-        snapshot. Useful for debugging non-determinism or regression checks.
+        Resets the existing run back to a checkpoint, deletes later steps and
+        checkpoints, and moves the same run back to `running`.
       operationId: replayRun
       parameters:
         - $ref: '#/components/parameters/RunId'
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              anyOf:
+                - required: [from_checkpoint_id]
+                - required: [checkpoint_id]
               properties:
-                from_step:
+                from_checkpoint_id:
                   type: string
-                  description: Optional def_step_id to start replay from.
+                  description: Canonical checkpoint id to replay from.
+                checkpoint_id:
+                  type: string
+                  description: Backward-compatible alias for `from_checkpoint_id`.
       responses:
-        '201':
-          description: Replay run created
+        '200':
+          description: Run reset to checkpoint and moved to running
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunCreated'
+                $ref: '#/components/schemas/ReplayRunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /workflows:
     post:
@@ -737,28 +757,24 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Workflow'
+                $ref: '#/components/schemas/WorkflowCreated'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '409':
-          description: Workflow id already exists
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
     get:
       tags: [Workflows]
       summary: List stored workflows
       operationId: listWorkflows
       responses:
         '200':
-          description: Array of workflows (definitions omitted in summary form)
+          description: Array of workflows including definitions
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/WorkflowSummary'
+                  $ref: '#/components/schemas/Workflow'
 
   /workflows/{id}:
     get:
@@ -780,9 +796,9 @@ paths:
       tags: [Workflows]
       summary: Update workflow definition
       description: |
-        Replaces the workflow definition. Increments `version`. Existing
-        runs already created from older versions are unaffected (they hold
-        a frozen snapshot of the workflow).
+        Replaces the workflow definition. If `version` is omitted, the stored
+        version is preserved. Existing runs already created from older versions
+        are unaffected because they hold a frozen snapshot of the workflow.
       operationId: updateWorkflow
       parameters:
         - $ref: '#/components/parameters/WorkflowId'
@@ -798,7 +814,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Workflow'
+                $ref: '#/components/schemas/OkResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -815,9 +831,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
+                $ref: '#/components/schemas/OkResponse'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -826,8 +840,9 @@ paths:
       tags: [Workflows]
       summary: Validate a stored workflow definition
       description: |
-        Runs the same validation as `POST /runs` but without creating a
-        run. Returns a list of validation errors (empty array on success).
+        Runs graph-based workflow validation without creating a run. Returns
+        a list of validation errors (empty array on success) and, when
+        generation succeeds, a Mermaid diagram.
       operationId: validateWorkflow
       parameters:
         - $ref: '#/components/parameters/WorkflowId'
@@ -840,6 +855,8 @@ paths:
                 $ref: '#/components/schemas/ValidationResult'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /workflows/{id}/mermaid:
     get:
@@ -869,16 +886,12 @@ paths:
       tags: [Workflows]
       summary: Launch a run from a stored workflow
       description: |
-        Convenience over `POST /runs` when the workflow definition is
-        already stored. Idempotency works the same way.
+        Convenience over `POST /runs` when the graph workflow definition is
+        already stored. The current implementation accepts an optional
+        `input` object and does not implement idempotency for this endpoint.
       operationId: runWorkflow
       parameters:
         - $ref: '#/components/parameters/WorkflowId'
-        - name: Idempotency-Key
-          in: header
-          required: false
-          schema:
-            type: string
       requestBody:
         required: false
         content:
@@ -889,30 +902,19 @@ paths:
                 input:
                   type: object
                   additionalProperties: true
-                callbacks:
-                  type: object
-                  additionalProperties: true
-                idempotency_key:
-                  type: string
       responses:
         '201':
           description: Run created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RunCreated'
-        '200':
-          description: Idempotent replay
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/RunCreated'
+                $ref: '#/components/schemas/RunStatusResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '503':
-          description: Drain mode
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /tracker/status:
     get:
@@ -920,8 +922,8 @@ paths:
       summary: NullTickets bridge status
       description: |
         Reports whether NullBoiler is connected to a NullTickets tracker
-        and basic queue health. Returns a degraded-but-200 status when
-        no tracker is configured.
+        and basic queue health. Returns `404 tracker_disabled` when no
+        tracker is configured.
       operationId: getTrackerStatus
       responses:
         '200':
@@ -930,6 +932,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TrackerStatus'
+        '404':
+          $ref: '#/components/responses/TrackerDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /tracker/tasks:
     get:
@@ -944,7 +950,11 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/TrackerRun'
+                  $ref: '#/components/schemas/TrackerTask'
+        '404':
+          $ref: '#/components/responses/TrackerDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /tracker/tasks/{task_id}:
     get:
@@ -963,9 +973,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TrackerRun'
+                $ref: '#/components/schemas/TrackerTask'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /tracker/stats:
     get:
@@ -978,34 +990,27 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties:
-                  type: integer
-                description: Map of `TrackerTaskState` to count.
-                example:
-                  running: 4
-                  completed: 192
-                  failed: 7
-                  stalled: 1
+                $ref: '#/components/schemas/TrackerStats'
+        '404':
+          $ref: '#/components/responses/TrackerDisabled'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /tracker/refresh:
     post:
       tags: [Tracker]
       summary: Force a tracker poll cycle
       description: |
-        Asks the tracker bridge to immediately claim and dispatch tasks
-        instead of waiting for the next poll tick. Idempotent — if a poll
-        is already in-flight, the request is dropped.
+        Acknowledges an operator refresh request. The current handler returns
+        success immediately.
       operationId: refreshTracker
       responses:
-        '202':
-          description: Refresh queued
+        '200':
+          description: Refresh request acknowledged
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  queued: { type: boolean, enum: [true] }
+                $ref: '#/components/schemas/TrackerRefreshResponse'
 
   /internal/agent-events/{run_id}/{step_id}:
     post:
@@ -1119,6 +1124,30 @@ components:
                 error:
                   code: not_found
                   message: run not found
+    Conflict:
+      description: Request conflicts with current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            conflict:
+              value:
+                error:
+                  code: conflict
+                  message: run is not failed
+    TrackerDisabled:
+      description: Pull-mode tracker is not configured
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            disabled:
+              value:
+                error:
+                  code: tracker_disabled
+                  message: pull-mode tracker is not configured
     InternalError:
       description: Internal server error
       content:
@@ -1172,6 +1201,7 @@ components:
             - internal
             - draining
             - unauthorized
+            - tracker_disabled
         message:
           type: string
 
@@ -1341,57 +1371,46 @@ components:
             True when at least one more page exists. Computed by
             fetching `limit + 1` rows and checking the overflow.
 
-    Run:
+    RunDetail:
       type: object
-      required: [id, status, workflow_id, created_at_ms, updated_at_ms]
+      required:
+        - id
+        - status
+        - created_at_ms
+        - updated_at_ms
+        - checkpoint_count
+        - total_input_tokens
+        - total_output_tokens
+        - total_tokens
+        - steps
       properties:
         id: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
         idempotency_key:
           type: string
-          nullable: true
-        status: { $ref: '#/components/schemas/RunStatus' }
+          description: Present only when the run was created with an idempotency key.
         workflow_id:
           type: string
-          nullable: true
+          description: Present only when the run was launched from a stored workflow.
         error_text:
           type: string
-          nullable: true
+          description: Present only when the run has an error.
+        started_at_ms: { type: integer, format: int64 }
+        ended_at_ms: { type: integer, format: int64 }
+        state_json:
+          type: object
+          additionalProperties: true
+          description: Present only when persisted state exists for the run.
+        checkpoint_count: { type: integer, format: int64, minimum: 0 }
+        total_input_tokens: { type: integer, format: int64, minimum: 0 }
+        total_output_tokens: { type: integer, format: int64, minimum: 0 }
+        total_tokens: { type: integer, format: int64, minimum: 0 }
         created_at_ms: { type: integer, format: int64 }
         updated_at_ms: { type: integer, format: int64 }
-        started_at_ms:
-          type: integer
-          format: int64
-          nullable: true
-        ended_at_ms:
-          type: integer
-          format: int64
-          nullable: true
-        parent_run_id:
-          type: string
-          nullable: true
-
-    RunDetail:
-      allOf:
-        - $ref: '#/components/schemas/Run'
-        - type: object
-          properties:
-            workflow:
-              type: object
-              additionalProperties: true
-              description: Frozen workflow snapshot for this run.
-            input:
-              type: object
-              additionalProperties: true
-            callbacks:
-              type: object
-              additionalProperties: true
-            state:
-              type: object
-              additionalProperties: true
-            steps:
-              type: array
-              items:
-                $ref: '#/components/schemas/Step'
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Step'
 
     RunCreate:
       type: object
@@ -1437,6 +1456,40 @@ components:
         idempotent_replay:
           type: boolean
 
+    RunStatusResponse:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+
+    ForkRunResponse:
+      type: object
+      required: [id, status, forked_from_checkpoint]
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        forked_from_checkpoint: { type: string }
+
+    ReplayRunResponse:
+      type: object
+      required: [id, status, replayed_from_checkpoint]
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        replayed_from_checkpoint: { type: string }
+
+    StateInjectionResponse:
+      type: object
+      required: [applied]
+      properties:
+        applied:
+          type: boolean
+          description: True when updates were applied immediately.
+        pending:
+          type: boolean
+          description: Present and true when updates were queued until `apply_after_step`.
+
     StepDefinition:
       type: object
       required: [id]
@@ -1463,7 +1516,7 @@ components:
         timeout_ms:
           type: integer
           format: int64
-          minimum: 0
+          minimum: 1
         prompt_template:
           type: string
         worker:
@@ -1510,13 +1563,11 @@ components:
         worker_id:
           type: string
           nullable: true
-        input:
-          type: object
-          additionalProperties: true
-        output:
+        output_json:
           type: object
           additionalProperties: true
           nullable: true
+          description: Present only after a step has output.
         error_text:
           type: string
           nullable: true
@@ -1569,6 +1620,52 @@ components:
           additionalProperties: true
         ts_ms: { type: integer, format: int64 }
 
+    StreamEvent:
+      type: object
+      required: [seq, event, mode, data]
+      properties:
+        seq: { type: integer, format: int64, minimum: 1 }
+        event: { type: string }
+        mode:
+          type: string
+          enum: [values, updates, tasks, debug, custom]
+        data:
+          type: object
+          additionalProperties: true
+
+    StreamPersistedEvent:
+      type: object
+      required: [kind, data, ts_ms]
+      properties:
+        kind: { type: string }
+        data:
+          type: object
+          additionalProperties: true
+        ts_ms: { type: integer, format: int64 }
+
+    StreamSnapshot:
+      type: object
+      required: [status, events, stream_events, next_stream_seq, stream_oldest_seq, stream_gap]
+      properties:
+        status: { $ref: '#/components/schemas/RunStatus' }
+        state:
+          type: object
+          additionalProperties: true
+          description: Present only when persisted state exists for the run.
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/StreamPersistedEvent'
+        stream_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/StreamEvent'
+        next_stream_seq: { type: integer, format: int64, minimum: 0 }
+        stream_oldest_seq: { type: integer, format: int64, minimum: 0 }
+        stream_gap:
+          type: boolean
+          description: True when requested events are older than the retained buffer.
+
     Checkpoint:
       type: object
       required: [id, run_id, step_id, version, created_at_ms]
@@ -1600,68 +1697,91 @@ components:
         id: { type: string }
         name: { type: string }
         definition:
-          type: object
-          required: [steps]
-          properties:
-            steps:
-              type: array
-              items:
-                $ref: '#/components/schemas/StepDefinition'
-            strategy:
-              type: string
+          $ref: '#/components/schemas/WorkflowDefinition'
         version: { type: integer, format: int64, minimum: 1 }
         created_at_ms: { type: integer, format: int64 }
         updated_at_ms: { type: integer, format: int64 }
 
-    WorkflowSummary:
+    WorkflowCreated:
       type: object
-      required: [id, name, version, created_at_ms, updated_at_ms]
+      required: [id, name, version]
       properties:
         id: { type: string }
         name: { type: string }
         version: { type: integer, format: int64 }
-        created_at_ms: { type: integer, format: int64 }
-        updated_at_ms: { type: integer, format: int64 }
+
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, enum: [true] }
+
+    WorkflowDefinition:
+      type: object
+      description: Graph workflow definition consumed by the engine.
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+          description: Map of node name to node configuration.
+        edges:
+          type: array
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: string
+          description: Directed edges such as `["__start__", "node"]` or `["router:yes", "next"]`.
+        state_schema:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        interrupt_before:
+          type: array
+          items: { type: string }
+        interrupt_after:
+          type: array
+          items: { type: string }
+      additionalProperties: true
 
     WorkflowCreate:
       type: object
-      required: [id, name, definition]
       properties:
         id:
           type: string
           minLength: 1
+          description: Optional. Generated when omitted.
         name:
           type: string
-          minLength: 1
-        definition:
-          type: object
-          required: [steps]
-          properties:
-            steps:
-              type: array
-              minItems: 1
-              items:
-                $ref: '#/components/schemas/StepDefinition'
-            strategy:
-              type: string
+          default: untitled
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 1
+        definition_json:
+          $ref: '#/components/schemas/WorkflowDefinition'
+      additionalProperties: true
 
     WorkflowUpdate:
       type: object
-      required: [definition]
       properties:
         name:
           type: string
-        definition:
-          type: object
-          required: [steps]
-          properties:
-            steps:
-              type: array
-              minItems: 1
-              items:
-                $ref: '#/components/schemas/StepDefinition'
-            strategy:
-              type: string
+          default: untitled
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Optional explicit version. When omitted, the existing version is preserved.
+        definition_json:
+          $ref: '#/components/schemas/WorkflowDefinition'
+      additionalProperties: true
 
     ValidationResult:
       type: object
@@ -1673,15 +1793,19 @@ components:
           type: array
           items:
             type: object
-            required: [code, message]
+            required: [type, message]
             properties:
-              code:
+              type:
+                type: string
+              node:
+                type: string
+              key:
                 type: string
               message:
                 type: string
-              path:
-                type: string
-                description: JSON pointer into the workflow definition.
+        mermaid:
+          type: string
+          description: Present when Mermaid generation succeeds.
 
     RateLimitEntry:
       type: object
@@ -1695,72 +1819,70 @@ components:
 
     TrackerStatus:
       type: object
-      required: [enabled]
+      required: [mode, running_count, max_concurrent, completed_count, failed_count, poll_interval_ms, running]
       properties:
-        enabled: { type: boolean }
-        url:
+        mode:
           type: string
-          format: uri
-          nullable: true
-        last_poll_ms:
-          type: integer
-          format: int64
-          nullable: true
-        active_leases: { type: integer, format: int64 }
-        message:
-          type: string
-          description: Human-readable status, especially when `enabled=false`.
+          enum: [pull]
+        running_count: { type: integer, format: int64, minimum: 0 }
+        max_concurrent: { type: integer, format: int64, minimum: 1 }
+        completed_count: { type: integer, format: int64, minimum: 0 }
+        failed_count: { type: integer, format: int64, minimum: 0 }
+        poll_interval_ms: { type: integer, format: int64, minimum: 1 }
+        running:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrackerTask'
 
-    TrackerRun:
+    TrackerTask:
       type: object
       required:
         - task_id
-        - tracker_run_id
-        - boiler_run_id
-        - lease_id
+        - task_title
         - pipeline_id
         - agent_role
-        - task_title
-        - task_stage
-        - task_version
-        - artifact_kind
+        - execution
+        - current_turn
+        - max_turns
+        - started_at_ms
+        - last_activity_ms
         - state
-        - claimed_at_ms
       properties:
         task_id: { type: string }
-        tracker_run_id: { type: string }
-        boiler_run_id: { type: string }
-        lease_id: { type: string }
+        task_title: { type: string }
         pipeline_id: { type: string }
         agent_role: { type: string }
-        task_title: { type: string }
-        task_stage: { type: string }
-        task_version: { type: integer, format: int64 }
-        success_trigger:
+        execution:
           type: string
-          nullable: true
-        artifact_kind: { type: string }
+          enum: [subprocess, dispatch]
+        current_turn: { type: integer, format: int64, minimum: 0 }
+        max_turns: { type: integer, format: int64, minimum: 1 }
+        started_at_ms: { type: integer, format: int64 }
+        last_activity_ms: { type: integer, format: int64 }
         state: { $ref: '#/components/schemas/TrackerTaskState' }
-        claimed_at_ms: { type: integer, format: int64 }
-        last_heartbeat_ms:
-          type: integer
-          format: int64
-          nullable: true
-        lease_expires_at_ms:
-          type: integer
-          format: int64
-          nullable: true
-        completed_at_ms:
-          type: integer
-          format: int64
-          nullable: true
-        last_error_text:
+
+    TrackerStats:
+      type: object
+      required: [running, completed, failed, total, max_concurrent]
+      properties:
+        running: { type: integer, format: int64, minimum: 0 }
+        completed: { type: integer, format: int64, minimum: 0 }
+        failed: { type: integer, format: int64, minimum: 0 }
+        total: { type: integer, format: int64, minimum: 0 }
+        max_concurrent: { type: integer, format: int64, minimum: 1 }
+
+    TrackerRefreshResponse:
+      type: object
+      required: [status, message]
+      properties:
+        status:
           type: string
-          nullable: true
+          enum: [ok]
+        message:
+          type: string
 
     AgentEventPayload:
       type: object
-      required: [iteration, status]
       properties:
         iteration:
           type: integer
@@ -1773,9 +1895,9 @@ components:
           type: object
           additionalProperties: true
           nullable: true
-        result_text:
+        result:
           type: string
           nullable: true
         status:
           type: string
-          enum: [tool_call, tool_result, model_step, error, completed]
+          default: running
