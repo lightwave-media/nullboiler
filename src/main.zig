@@ -714,6 +714,63 @@ test "worker_protocol hasExplicitPath identifies explicit path URLs" {
     try std.testing.expect(worker_protocol.hasExplicitPath("http://localhost:3000/webhook"));
 }
 
+test "readHttpRequest does not block when request is smaller than chunk" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const c_sys = std.posix.system;
+
+    const server_addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try server_addr.listen(std_compat.io(), .{ .reuse_address = true });
+    defer server.deinit(std_compat.io());
+
+    const port = server.socket.address.ip4.port;
+
+    const sock_rc = c_sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(sock_rc >= 0);
+    const client_fd: std.posix.fd_t = @intCast(sock_rc);
+    defer _ = c_sys.close(client_fd);
+
+    var sin: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+    };
+    const cr = c_sys.connect(client_fd, @ptrCast(&sin), @sizeOf(@TypeOf(sin)));
+    try std.testing.expectEqual(@as(c_int, 0), cr);
+
+    var conn = try server.accept(std_compat.io());
+    defer conn.close(std_compat.io());
+
+    // Convert a blocking read regression into a bounded test failure.
+    const tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
+    const timeout_rc = c_sys.setsockopt(
+        conn.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        @ptrCast(&tv),
+        @sizeOf(@TypeOf(tv)),
+    );
+    try std.testing.expectEqual(@as(c_int, 0), timeout_rc);
+
+    // Keep the write side open so reads waiting for EOF would stall.
+    const req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const sent = c_sys.send(client_fd, req.ptr, req.len, 0);
+    try std.testing.expectEqual(@as(isize, @intCast(req.len)), sent);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const t0 = ids.nowMs();
+    const parsed = try readHttpRequest(arena.allocator(), &conn, max_request_size);
+    const elapsed_ms = ids.nowMs() - t0;
+
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualStrings("GET", parsed.?.method);
+    try std.testing.expectEqualStrings("/health", parsed.?.target);
+
+    try std.testing.expect(elapsed_ms < 200);
+}
+
 comptime {
     _ = @import("ids.zig");
     _ = @import("types.zig");
