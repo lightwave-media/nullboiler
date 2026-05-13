@@ -1959,6 +1959,7 @@ fn validationErrorResponse(err: workflow_validation.ValidateError) HttpResponse 
         error.StepIdMissingOrNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"each step must have string field 'id'\"}}"),
         error.StepIdEmpty => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"step id must not be empty\"}}"),
         error.StepIdDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"duplicate step id\"}}"),
+        error.StepTypeUnknown => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"unknown step type\"}}"),
         error.DependsOnNotArray => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on must be an array\"}}"),
         error.DependsOnItemNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on items must be strings\"}}"),
         error.DependsOnDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on contains duplicate step id\"}}"),
@@ -2369,6 +2370,26 @@ test "API: create run rejects duplicate depends_on items" {
 
     const body =
         \\{"steps":[{"id":"a","type":"task","prompt_template":"a"},{"id":"b","type":"task","prompt_template":"b","depends_on":["a","a"]}]}
+    ;
+    const resp = handleRequest(&ctx, "POST", "/runs", body);
+    try std.testing.expectEqual(@as(u16, 400), resp.status_code);
+}
+
+test "API: create run rejects unknown step type" {
+    const allocator = std.testing.allocator;
+    var store = try Store.init(allocator, ":memory:");
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var ctx = Context{
+        .store = &store,
+        .allocator = arena.allocator(),
+    };
+
+    const body =
+        \\{"steps":[{"id":"legacy-wait","type":"wait"}]}
     ;
     const resp = handleRequest(&ctx, "POST", "/runs", body);
     try std.testing.expectEqual(@as(u16, 400), resp.status_code);

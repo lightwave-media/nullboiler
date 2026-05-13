@@ -147,12 +147,40 @@ wait_for_step_status() {
     return 1
 }
 
+# wait_for_run_status RUN_ID EXPECTED_STATUS [ATTEMPTS] [SLEEP_SECONDS]
+# Poll until a run reaches the expected status. Sets WAITED_RUN_STATUS.
+wait_for_run_status() {
+    local run_id="$1" expected="$2" attempts="${3:-30}" delay="${4:-0.2}"
+    WAITED_RUN_STATUS=""
+    for _i in $(seq 1 "$attempts"); do
+        local resp
+        resp=$(safe_curl "$BASE_URL/runs/$run_id")
+        local code body
+        code="${resp##*HTTPCODE:}"
+        body="${resp%HTTPCODE:*}"
+        body="${body%
+}"
+        if [ "$code" = "200" ]; then
+            WAITED_RUN_STATUS=$(json_field "$body" "status")
+            if [ "$WAITED_RUN_STATUS" = "$expected" ]; then
+                return 0
+            fi
+            if [ "$WAITED_RUN_STATUS" = "failed" ] || [ "$WAITED_RUN_STATUS" = "cancelled" ]; then
+                return 1
+            fi
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$PROJECT_DIR/zig-out/bin/nullboiler"
 PORT=$((10000 + RANDOM % 50000))
 DB_FILE=$(mktemp /tmp/nullboiler_test_XXXXXX.db)
+CONFIG_FILE=$(mktemp /tmp/nullboiler_config_XXXXXX.json)
 SERVER_PID=""
 MOCK_WORKER1_PID=""
 MOCK_WORKER2_PID=""
@@ -182,6 +210,7 @@ cleanup() {
         wait "$SERVER_PID" 2>/dev/null || true
     fi
     rm -f "$DB_FILE" "${DB_FILE}-shm" "${DB_FILE}-wal" "${DB_FILE}-journal"
+    rm -f "$CONFIG_FILE"
     if [ -n "$WORKER1_LOG" ]; then rm -f "$WORKER1_LOG"; fi
     if [ -n "$WORKER2_LOG" ]; then rm -f "$WORKER2_LOG"; fi
 }
@@ -210,8 +239,22 @@ fi
 
 # ── Start server ─────────────────────────────────────────────────────────────
 
+cat >"$CONFIG_FILE" <<EOF
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "db": "nullboiler.db",
+  "strategies_dir": "$PROJECT_DIR/strategies",
+  "workers": [],
+  "engine": {
+    "poll_interval_ms": 100,
+    "shutdown_grace_ms": 1000
+  }
+}
+EOF
+
 echo "Starting server on port $PORT with DB $DB_FILE..."
-"$BINARY" --port "$PORT" --db "$DB_FILE" &>/dev/null &
+"$BINARY" --config "$CONFIG_FILE" --port "$PORT" --db "$DB_FILE" &>/dev/null &
 SERVER_PID=$!
 
 # Wait for the server to be ready (health check retry loop, max ~5s)
@@ -647,97 +690,63 @@ fi  # RUN_ID guard for events
 # =============================================================================
 
 echo ""
-printf '%b--- Approve / Reject ---%b\n' "$BOLD" "$RESET"
+printf '%b--- Interrupt / Resume ---%b\n' "$BOLD" "$RESET"
 
-# Create a run with an approval step to test approve
-RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+INTERRUPT_DEF='{"nodes":{"pause":{"type":"interrupt"},"after":{"type":"transform","updates":"{\"resumed\":true}"}},"edges":[["__start__","pause"],["pause","after"],["after","__end__"]],"state_schema":{"resumed":{"type":"boolean","reducer":"last_value"}}}'
+RESP=$(safe_curl -X POST "$BASE_URL/workflows" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"approve_step","type":"approval","worker_tags":["tester"],"prompt_template":"Approve this"}],"input":{}}')
+    -d "{\"id\":\"e2e-interrupt\",\"name\":\"E2E Interrupt\",\"definition_json\":$INTERRUPT_DEF}")
 parse_resp "$RESP"
-APPROVE_RUN_ID=""
 
 if [ "$HTTP_CODE" = "201" ]; then
-    APPROVE_RUN_ID=$(json_field "$BODY" "id")
-fi
-
-if [ -z "$APPROVE_RUN_ID" ]; then
-    skip "Approval step is in waiting_approval status" "failed to create approval run"
-    skip "POST /runs/{id}/steps/{step_id}/approve returns 200" "failed to create approval run"
-    skip "POST /runs/{id}/steps/{step_id}/approve step status is completed" "failed to create approval run"
+    pass "POST /workflows creates interrupt workflow"
 else
-    # Poll until the engine transitions the step to waiting_approval (~4s max)
-    if wait_for_step_status "$APPROVE_RUN_ID" "waiting_approval"; then
-        pass "Approval step is in waiting_approval status"
-    else
-        fail "Approval step status" "expected 'waiting_approval', got '${WAITED_STEP_STATUS:-empty}'"
-    fi
-
-    if [ -n "$WAITED_STEP_ID" ]; then
-        # 26. POST /runs/{id}/steps/{step_id}/approve
-        RESP=$(safe_curl -X POST "$BASE_URL/runs/$APPROVE_RUN_ID/steps/$WAITED_STEP_ID/approve")
-        parse_resp "$RESP"
-
-        if [ "$HTTP_CODE" = "200" ]; then
-            pass "POST /runs/{id}/steps/{step_id}/approve returns 200"
-            APPROVE_RESULT_STATUS=$(json_field "$BODY" "status")
-            if [ "$APPROVE_RESULT_STATUS" = "completed" ]; then
-                pass "POST /runs/{id}/steps/{step_id}/approve step status is completed"
-            else
-                fail "POST /runs/{id}/steps/{step_id}/approve step status" "expected 'completed', got '$APPROVE_RESULT_STATUS'"
-            fi
-        else
-            fail "POST /runs/{id}/steps/{step_id}/approve returns 200" "got HTTP $HTTP_CODE; body: $BODY"
-            skip "POST /runs/{id}/steps/{step_id}/approve step status is completed" "approve request failed"
-        fi
-    else
-        skip "POST /runs/{id}/steps/{step_id}/approve returns 200" "no step_id found"
-        skip "POST /runs/{id}/steps/{step_id}/approve step status is completed" "no step_id found"
-    fi
+    fail "POST /workflows creates interrupt workflow" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
 fi
 
-# Now test reject: create another run with an approval step
-RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+RESP=$(safe_curl -X POST "$BASE_URL/workflows/e2e-interrupt/run" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"reject_step","type":"approval","worker_tags":["tester"],"prompt_template":"Reject this"}],"input":{}}')
+    -d '{"input":{}}')
 parse_resp "$RESP"
-REJECT_RUN_ID=""
-
+INTERRUPT_RUN_ID=""
 if [ "$HTTP_CODE" = "201" ]; then
-    REJECT_RUN_ID=$(json_field "$BODY" "id")
+    INTERRUPT_RUN_ID=$(json_field "$BODY" "id")
 fi
 
-if [ -z "$REJECT_RUN_ID" ]; then
-    skip "Reject-target step is in waiting_approval status" "failed to create rejection run"
-    skip "POST /runs/{id}/steps/{step_id}/reject returns 200" "failed to create rejection run"
-    skip "POST /runs/{id}/steps/{step_id}/reject step status is failed" "failed to create rejection run"
+if [ -z "$INTERRUPT_RUN_ID" ]; then
+    fail "POST /workflows/{id}/run starts interrupt run" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
+    skip "Interrupt workflow reaches interrupted status" "run creation failed"
+    skip "POST /runs/{id}/resume returns 200" "run creation failed"
+    skip "Interrupted workflow completes after resume" "run creation failed"
 else
-    # Poll until the engine transitions the step to waiting_approval (~4s max)
-    if wait_for_step_status "$REJECT_RUN_ID" "waiting_approval"; then
-        pass "Reject-target step is in waiting_approval status"
+    pass "POST /workflows/{id}/run starts interrupt run"
+
+    if wait_for_run_status "$INTERRUPT_RUN_ID" "interrupted" 30 0.2; then
+        pass "Interrupt workflow reaches interrupted status"
     else
-        fail "Reject-target step status" "expected 'waiting_approval', got '${WAITED_STEP_STATUS:-empty}'"
+        fail "Interrupt workflow reaches interrupted status" "expected 'interrupted', got '${WAITED_RUN_STATUS:-empty}'"
     fi
 
-    if [ -n "$WAITED_STEP_ID" ]; then
-        # 28. POST /runs/{id}/steps/{step_id}/reject
-        RESP=$(safe_curl -X POST "$BASE_URL/runs/$REJECT_RUN_ID/steps/$WAITED_STEP_ID/reject")
-        parse_resp "$RESP"
+    RESP=$(safe_curl -X POST "$BASE_URL/runs/$INTERRUPT_RUN_ID/resume" \
+        -H "Content-Type: application/json" \
+        -d '{"state_updates":{"resumed":false}}')
+    parse_resp "$RESP"
+    if [ "$HTTP_CODE" = "200" ]; then
+        pass "POST /runs/{id}/resume returns 200"
+    else
+        fail "POST /runs/{id}/resume returns 200" "got HTTP $HTTP_CODE; body: $BODY"
+    fi
 
-        if [ "$HTTP_CODE" = "200" ]; then
-            pass "POST /runs/{id}/steps/{step_id}/reject returns 200"
-            REJECT_RESULT_STATUS=$(json_field "$BODY" "status")
-            if [ "$REJECT_RESULT_STATUS" = "failed" ]; then
-                pass "POST /runs/{id}/steps/{step_id}/reject step status is failed"
-            else
-                fail "POST /runs/{id}/steps/{step_id}/reject step status" "expected 'failed', got '$REJECT_RESULT_STATUS'"
-            fi
+    if wait_for_run_status "$INTERRUPT_RUN_ID" "completed" 30 0.2; then
+        RESP=$(safe_curl "$BASE_URL/runs/$INTERRUPT_RUN_ID")
+        parse_resp "$RESP"
+        if [ "$HTTP_CODE" = "200" ] && printf '%s' "$BODY" | grep -q '"resumed":true'; then
+            pass "Interrupted workflow completes after resume"
         else
-            fail "POST /runs/{id}/steps/{step_id}/reject returns 200" "got HTTP $HTTP_CODE; body: $BODY"
-            skip "POST /runs/{id}/steps/{step_id}/reject step status is failed" "reject request failed"
+            fail "Interrupted workflow completes after resume" "final state missing resumed=true"
         fi
     else
-        skip "POST /runs/{id}/steps/{step_id}/reject returns 200" "no step_id found"
-        skip "POST /runs/{id}/steps/{step_id}/reject step status is failed" "no step_id found"
+        fail "Interrupted workflow completes after resume" "expected 'completed', got '${WAITED_RUN_STATUS:-empty}'"
     fi
 fi
 
@@ -806,16 +815,26 @@ else
 fi
 
 # =============================================================================
-# Advanced Step Type Tests (no workers required)
+# Graph Workflow Tests (no workers required)
 # =============================================================================
 
-printf '\n%b--- Advanced Step Type Tests ---%b\n\n' "$BOLD" "$RESET"
+printf '\n%b--- Graph Workflow Tests ---%b\n\n' "$BOLD" "$RESET"
 
-# ── Test: Transform step completes with output_template ─────────────
-
-RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+TRANSFORM_DEF='{"nodes":{"prep":{"type":"transform","updates":"{\"result\":\"transformed_data\"}"}},"edges":[["__start__","prep"],["prep","__end__"]],"state_schema":{"result":{"type":"string","reducer":"last_value"}}}'
+RESP=$(safe_curl -X POST "$BASE_URL/workflows" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"prep","type":"transform","output_template":"transformed_data"}],"input":{"value":"test"}}')
+    -d "{\"id\":\"e2e-transform\",\"name\":\"E2E Transform\",\"definition_json\":$TRANSFORM_DEF}")
+parse_resp "$RESP"
+
+if [ "$HTTP_CODE" = "201" ]; then
+    pass "POST /workflows creates transform workflow"
+else
+    fail "POST /workflows creates transform workflow" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
+fi
+
+RESP=$(safe_curl -X POST "$BASE_URL/workflows/e2e-transform/run" \
+    -H "Content-Type: application/json" \
+    -d '{"input":{"value":"test"}}')
 parse_resp "$RESP"
 
 TRANSFORM_RUN_ID=""
@@ -824,239 +843,111 @@ if [ "$HTTP_CODE" = "201" ]; then
 fi
 
 if [ -z "$TRANSFORM_RUN_ID" ]; then
-    fail "Transform step run created" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
-    skip "Transform step completes" "run creation failed"
-    skip "Transform step has output" "run creation failed"
+    fail "Transform workflow run created" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
+    skip "Transform workflow completes" "run creation failed"
+    skip "Transform workflow updates state" "run creation failed"
 else
-    # Poll until run completes or timeout (~6s)
-    TRANSFORM_STATUS=""
-    for _i in $(seq 1 30); do
-        RESP=$(safe_curl "$BASE_URL/runs/$TRANSFORM_RUN_ID")
-        parse_resp "$RESP"
-        if [ "$HTTP_CODE" = "200" ]; then
-            TRANSFORM_STATUS=$(json_field "$BODY" "status")
-            if [ "$TRANSFORM_STATUS" = "completed" ] || [ "$TRANSFORM_STATUS" = "failed" ]; then
-                break
-            fi
-        fi
-        sleep 0.2
-    done
-
-    if [ "$TRANSFORM_STATUS" = "completed" ]; then
-        pass "Transform step completes"
+    if wait_for_run_status "$TRANSFORM_RUN_ID" "completed" 30 0.2; then
+        pass "Transform workflow completes"
     else
-        fail "Transform step completes" "expected 'completed', got '$TRANSFORM_STATUS'"
+        fail "Transform workflow completes" "expected 'completed', got '${WAITED_RUN_STATUS:-empty}'"
     fi
 
-    # Verify step has output
-    RESP=$(safe_curl "$BASE_URL/runs/$TRANSFORM_RUN_ID/steps")
+    RESP=$(safe_curl "$BASE_URL/runs/$TRANSFORM_RUN_ID")
     parse_resp "$RESP"
-    if [ "$HTTP_CODE" = "200" ]; then
-        STEP_OUTPUT=$(json_array_first_field "$BODY" "output_json")
-        STEP_STATUS=$(json_array_first_field "$BODY" "status")
-        if [ "$STEP_STATUS" = "completed" ] && [ -n "$STEP_OUTPUT" ] && [ "$STEP_OUTPUT" != "null" ]; then
-            pass "Transform step has output"
-        else
-            fail "Transform step has output" "status='$STEP_STATUS', output='$STEP_OUTPUT'"
-        fi
+    if [ "$HTTP_CODE" = "200" ] && printf '%s' "$BODY" | grep -q '"result":"transformed_data"'; then
+        pass "Transform workflow updates state"
     else
-        fail "Transform step has output" "failed to fetch steps (HTTP $HTTP_CODE)"
+        fail "Transform workflow updates state" "result not found in run state"
     fi
 fi
 
-# ── Test: Wait step — duration mode ──────────────────────────────────
-
-RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+ROUTE_DEF='{"nodes":{"decide":{"type":"route","input":"state.decision","default":"no"},"yes":{"type":"transform","updates":"{\"path\":\"yes\"}"},"no":{"type":"transform","updates":"{\"path\":\"no\"}"}},"edges":[["__start__","decide"],["decide:yes","yes"],["decide:no","no"],["yes","__end__"],["no","__end__"]],"state_schema":{"decision":{"type":"string","reducer":"last_value"},"path":{"type":"string","reducer":"last_value"}}}'
+RESP=$(safe_curl -X POST "$BASE_URL/workflows" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"pause","type":"wait","duration_ms":500}],"input":{}}')
+    -d "{\"id\":\"e2e-route\",\"name\":\"E2E Route\",\"definition_json\":$ROUTE_DEF}")
 parse_resp "$RESP"
 
-WAIT_DUR_RUN_ID=""
 if [ "$HTTP_CODE" = "201" ]; then
-    WAIT_DUR_RUN_ID=$(json_field "$BODY" "id")
-fi
-
-if [ -z "$WAIT_DUR_RUN_ID" ]; then
-    fail "Wait (duration) step run created" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
-    skip "Wait (duration) step completes" "run creation failed"
-    skip "Wait (duration) step has waited_ms in output" "run creation failed"
+    pass "POST /workflows creates route workflow"
 else
-    # Poll until run completes or timeout (~6s)
-    WAIT_DUR_STATUS=""
-    for _i in $(seq 1 30); do
-        RESP=$(safe_curl "$BASE_URL/runs/$WAIT_DUR_RUN_ID")
-        parse_resp "$RESP"
-        if [ "$HTTP_CODE" = "200" ]; then
-            WAIT_DUR_STATUS=$(json_field "$BODY" "status")
-            if [ "$WAIT_DUR_STATUS" = "completed" ] || [ "$WAIT_DUR_STATUS" = "failed" ]; then
-                break
-            fi
-        fi
-        sleep 0.2
-    done
-
-    if [ "$WAIT_DUR_STATUS" = "completed" ]; then
-        pass "Wait (duration) step completes"
-    else
-        fail "Wait (duration) step completes" "expected 'completed', got '$WAIT_DUR_STATUS'"
-    fi
-
-    # Verify step output contains waited_ms
-    RESP=$(safe_curl "$BASE_URL/runs/$WAIT_DUR_RUN_ID/steps")
-    parse_resp "$RESP"
-    if [ "$HTTP_CODE" = "200" ]; then
-        if printf '%s' "$BODY" | grep -q "waited_ms"; then
-            pass "Wait (duration) step has waited_ms in output"
-        else
-            fail "Wait (duration) step has waited_ms in output" "waited_ms not found in steps response"
-        fi
-    else
-        fail "Wait (duration) step has waited_ms in output" "failed to fetch steps (HTTP $HTTP_CODE)"
-    fi
+    fail "POST /workflows creates route workflow" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
 fi
 
-# ── Test: Wait step — signal mode ────────────────────────────────────
-
-RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+RESP=$(safe_curl -X POST "$BASE_URL/workflows/e2e-route/run" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"wait_signal","type":"wait","signal":"deploy_ready"}],"input":{}}')
+    -d '{"input":{"decision":"yes"}}')
 parse_resp "$RESP"
 
-WAIT_SIG_RUN_ID=""
+ROUTE_RUN_ID=""
 if [ "$HTTP_CODE" = "201" ]; then
-    WAIT_SIG_RUN_ID=$(json_field "$BODY" "id")
+    ROUTE_RUN_ID=$(json_field "$BODY" "id")
 fi
 
-if [ -z "$WAIT_SIG_RUN_ID" ]; then
-    fail "Wait (signal) step run created" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
-    skip "Wait (signal) step enters waiting_approval" "run creation failed"
-    skip "POST /runs/{id}/steps/{step_id}/signal returns 200" "run creation failed"
-    skip "Wait (signal) step completes after signal" "run creation failed"
+if [ -z "$ROUTE_RUN_ID" ]; then
+    fail "Route workflow run created" "expected 201, got HTTP $HTTP_CODE; body: $BODY"
+    skip "Route workflow completes" "run creation failed"
+    skip "Route workflow takes matching edge" "run creation failed"
 else
-    # Poll until the step reaches waiting_approval
-    if wait_for_step_status "$WAIT_SIG_RUN_ID" "waiting_approval"; then
-        pass "Wait (signal) step enters waiting_approval"
+    if wait_for_run_status "$ROUTE_RUN_ID" "completed" 30 0.2; then
+        pass "Route workflow completes"
     else
-        fail "Wait (signal) step enters waiting_approval" "expected 'waiting_approval', got '${WAITED_STEP_STATUS:-empty}'"
+        fail "Route workflow completes" "expected 'completed', got '${WAITED_RUN_STATUS:-empty}'"
     fi
 
-    if [ -n "$WAITED_STEP_ID" ]; then
-        # POST signal to wake it up
-        RESP=$(safe_curl -X POST "$BASE_URL/runs/$WAIT_SIG_RUN_ID/steps/$WAITED_STEP_ID/signal" \
-            -H "Content-Type: application/json" \
-            -d '{"signal":"deploy_ready","data":{"version":"1.0"}}')
-        parse_resp "$RESP"
-
-        if [ "$HTTP_CODE" = "200" ]; then
-            pass "POST /runs/{id}/steps/{step_id}/signal returns 200"
-        else
-            fail "POST /runs/{id}/steps/{step_id}/signal returns 200" "got HTTP $HTTP_CODE; body: $BODY"
-        fi
-
-        # Verify step completed with signal data
-        RESP=$(safe_curl "$BASE_URL/runs/$WAIT_SIG_RUN_ID/steps/$WAITED_STEP_ID")
-        parse_resp "$RESP"
-        if [ "$HTTP_CODE" = "200" ]; then
-            SIG_STEP_STATUS=$(json_field "$BODY" "status")
-            if [ "$SIG_STEP_STATUS" = "completed" ]; then
-                if printf '%s' "$BODY" | grep -q "signaled"; then
-                    pass "Wait (signal) step completes after signal"
-                else
-                    pass "Wait (signal) step completes after signal"
-                fi
-            else
-                fail "Wait (signal) step completes after signal" "expected 'completed', got '$SIG_STEP_STATUS'"
-            fi
-        else
-            fail "Wait (signal) step completes after signal" "failed to fetch step (HTTP $HTTP_CODE)"
-        fi
+    RESP=$(safe_curl "$BASE_URL/runs/$ROUTE_RUN_ID")
+    parse_resp "$RESP"
+    if [ "$HTTP_CODE" = "200" ] && printf '%s' "$BODY" | grep -q '"path":"yes"'; then
+        pass "Route workflow takes matching edge"
     else
-        skip "POST /runs/{id}/steps/{step_id}/signal returns 200" "no step_id found"
-        skip "Wait (signal) step completes after signal" "no step_id found"
+        fail "Route workflow takes matching edge" "path=yes not found in run state"
     fi
 fi
 
-# ── Test: API validation — missing required fields ───────────────────
+# ── Test: API validation ─────────────────────────────────────────────
 
-# Loop step without body
 RESP=$(safe_curl -X POST "$BASE_URL/runs" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"bad_loop","type":"loop","max_iterations":3}],"input":{}}')
+    -d '{"steps":[{"id":"bad_retry","type":"task","retry":1}],"input":{}}')
 parse_resp "$RESP"
 
 if [ "$HTTP_CODE" = "400" ]; then
-    pass "Loop step without body returns 400"
+    pass "Retry field with non-object value returns 400"
 else
-    fail "Loop step without body returns 400" "expected 400, got HTTP $HTTP_CODE"
+    fail "Retry field with non-object value returns 400" "expected 400, got HTTP $HTTP_CODE"
 fi
 
-# Wait step without any mode field
 RESP=$(safe_curl -X POST "$BASE_URL/runs" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"bad_wait","type":"wait"}],"input":{}}')
+    -d '{"steps":[{"id":"legacy_wait","type":"wait"}],"input":{}}')
 parse_resp "$RESP"
 
 if [ "$HTTP_CODE" = "400" ]; then
-    pass "Wait step without mode field returns 400"
+    pass "Unknown legacy step type returns 400"
 else
-    fail "Wait step without mode field returns 400" "expected 400, got HTTP $HTTP_CODE"
+    fail "Unknown legacy step type returns 400" "expected 400, got HTTP $HTTP_CODE"
 fi
 
-# Router step without routes
 RESP=$(safe_curl -X POST "$BASE_URL/runs" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"bad_router","type":"router"}],"input":{}}')
+    -d '{"steps":[{"id":"bad_timeout","type":"task","timeout_ms":0}],"input":{}}')
 parse_resp "$RESP"
 
 if [ "$HTTP_CODE" = "400" ]; then
-    pass "Router step without routes returns 400"
+    pass "Non-positive timeout_ms returns 400"
 else
-    fail "Router step without routes returns 400" "expected 400, got HTTP $HTTP_CODE"
+    fail "Non-positive timeout_ms returns 400" "expected 400, got HTTP $HTTP_CODE"
 fi
 
-# ── Test: Chat transcript API ────────────────────────────────────────
-
-# Create a group_chat step run (needs participants for validation)
 RESP=$(safe_curl -X POST "$BASE_URL/runs" \
     -H "Content-Type: application/json" \
-    -d '{"steps":[{"id":"gc1","type":"group_chat","participants":["agent_a","agent_b"],"rounds":1,"worker_tags":["tester"],"prompt_template":"discuss"}],"input":{}}')
+    -d '{"steps":[{"id":"a","type":"task"},{"id":"b","type":"task","depends_on":["a","a"]}],"input":{}}')
 parse_resp "$RESP"
 
-CHAT_RUN_ID=""
-CHAT_STEP_ID=""
-if [ "$HTTP_CODE" = "201" ]; then
-    CHAT_RUN_ID=$(json_field "$BODY" "id")
-fi
-
-if [ -z "$CHAT_RUN_ID" ]; then
-    skip "GET /runs/{id}/steps/{step_id}/chat returns JSON array" "failed to create group_chat run (HTTP $HTTP_CODE)"
+if [ "$HTTP_CODE" = "400" ]; then
+    pass "Duplicate depends_on items return 400"
 else
-    # Get the step ID
-    RESP=$(safe_curl "$BASE_URL/runs/$CHAT_RUN_ID/steps")
-    parse_resp "$RESP"
-    if [ "$HTTP_CODE" = "200" ]; then
-        CHAT_STEP_ID=$(json_array_first_field "$BODY" "id")
-    fi
-
-    if [ -z "$CHAT_STEP_ID" ]; then
-        skip "GET /runs/{id}/steps/{step_id}/chat returns JSON array" "failed to get step_id"
-    else
-        RESP=$(safe_curl "$BASE_URL/runs/$CHAT_RUN_ID/steps/$CHAT_STEP_ID/chat")
-        parse_resp "$RESP"
-
-        if [ "$HTTP_CODE" = "200" ]; then
-            if json_is_array "$BODY"; then
-                pass "GET /runs/{id}/steps/{step_id}/chat returns JSON array"
-            else
-                fail "GET /runs/{id}/steps/{step_id}/chat returns JSON array" "response is not a JSON array: $BODY"
-            fi
-        else
-            fail "GET /runs/{id}/steps/{step_id}/chat returns JSON array" "expected 200, got HTTP $HTTP_CODE"
-        fi
-    fi
-
-    # Clean up: cancel the group_chat run so it doesn't interfere
-    safe_curl -X POST "$BASE_URL/runs/$CHAT_RUN_ID/cancel" >/dev/null
+    fail "Duplicate depends_on items return 400" "expected 400, got HTTP $HTTP_CODE"
 fi
 
 # =============================================================================
@@ -1144,9 +1035,21 @@ else
 
         # ── Test: Simple task workflow ──────────────────────────────────
 
-        RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+        DEMO_SIMPLE_DEF='{"nodes":{"greet":{"type":"task","worker_tags":["researcher"],"prompt_template":"Hello {{input.name}}"}},"edges":[["__start__","greet"],["greet","__end__"]],"state_schema":{"output":{"type":"string","reducer":"last_value"}}}'
+        RESP=$(safe_curl -X POST "$BASE_URL/workflows" \
             -H "Content-Type: application/json" \
-            -d '{"steps":[{"id":"greet","type":"task","worker_tags":["researcher"],"prompt_template":"Hello {{input.name}}"}],"input":{"name":"NullBoiler"}}')
+            -d "{\"id\":\"e2e-demo-simple\",\"name\":\"E2E Demo Simple\",\"definition_json\":$DEMO_SIMPLE_DEF}")
+        parse_resp "$RESP"
+
+        if [ "$HTTP_CODE" != "201" ]; then
+            fail "Simple task workflow completes" "failed to create workflow (HTTP $HTTP_CODE; body: $BODY)"
+            skip "Simple task step has output" "workflow creation failed"
+            DEMO_FAIL_COUNT=$((DEMO_FAIL_COUNT + 1))
+            DEMO_RUN_ID=""
+        else
+        RESP=$(safe_curl -X POST "$BASE_URL/workflows/e2e-demo-simple/run" \
+            -H "Content-Type: application/json" \
+            -d '{"input":{"name":"NullBoiler"}}')
         parse_resp "$RESP"
 
         DEMO_RUN_ID=""
@@ -1190,12 +1093,25 @@ else
                 DEMO_FAIL_COUNT=$((DEMO_FAIL_COUNT + 1))
             fi
         fi
+        fi
 
         # ── Test: Sequential (2-step) workflow ──────────────────────────
 
-        RESP=$(safe_curl -X POST "$BASE_URL/runs" \
+        DEMO_SEQ_DEF='{"nodes":{"research":{"type":"task","worker_tags":["researcher"],"prompt_template":"Research {{input.topic}}"},"write":{"type":"task","worker_tags":["writer"],"prompt_template":"Write about: {{state.output}}"}},"edges":[["__start__","research"],["research","write"],["write","__end__"]],"state_schema":{"output":{"type":"string","reducer":"last_value"}}}'
+        RESP=$(safe_curl -X POST "$BASE_URL/workflows" \
             -H "Content-Type: application/json" \
-            -d '{"steps":[{"id":"research","type":"task","worker_tags":["researcher"],"prompt_template":"Research {{input.topic}}"},{"id":"write","type":"task","depends_on":["research"],"worker_tags":["writer"],"prompt_template":"Write about: {{steps.research.output}}"}],"input":{"topic":"DAG engines"}}')
+            -d "{\"id\":\"e2e-demo-seq\",\"name\":\"E2E Demo Sequential\",\"definition_json\":$DEMO_SEQ_DEF}")
+        parse_resp "$RESP"
+
+        if [ "$HTTP_CODE" != "201" ]; then
+            fail "Sequential workflow completes" "failed to create workflow (HTTP $HTTP_CODE; body: $BODY)"
+            skip "Sequential workflow: both steps completed" "workflow creation failed"
+            DEMO_FAIL_COUNT=$((DEMO_FAIL_COUNT + 1))
+            SEQ_RUN_ID=""
+        else
+        RESP=$(safe_curl -X POST "$BASE_URL/workflows/e2e-demo-seq/run" \
+            -H "Content-Type: application/json" \
+            -d '{"input":{"topic":"DAG engines"}}')
         parse_resp "$RESP"
 
         SEQ_RUN_ID=""
@@ -1249,6 +1165,7 @@ else
                 DEMO_FAIL_COUNT=$((DEMO_FAIL_COUNT + 1))
             fi
         fi
+        fi
 
         # ── Cleanup: unregister demo workers ────────────────────────────
         safe_curl -X DELETE "$BASE_URL/workers/mock-researcher" >/dev/null
@@ -1296,8 +1213,8 @@ if [ "$HTTP_CODE" = "201" ]; then
             fi
 
             # First step should be ready (no deps), rest pending
-            S1_STATUS=$(printf '%s' "$BODY" | jq -r '.[0].status' 2>/dev/null)
-            S2_STATUS=$(printf '%s' "$BODY" | jq -r '.[1].status' 2>/dev/null)
+            S1_STATUS=$(printf '%s' "$BODY" | jq -r '.[] | select(.def_step_id=="s1") | .status' 2>/dev/null | head -1)
+            S2_STATUS=$(printf '%s' "$BODY" | jq -r '.[] | select(.def_step_id=="s2") | .status' 2>/dev/null | head -1)
             if [ "$S1_STATUS" = "ready" ] || [ "$S1_STATUS" = "running" ]; then
                 pass "Sequential strategy: first step is ready/running ($S1_STATUS)"
             else
@@ -1340,8 +1257,8 @@ if [ "$HTTP_CODE" = "201" ]; then
                 fail "Parallel strategy step count" "expected 2, got $STEP_COUNT"
             fi
 
-            P1_STATUS=$(printf '%s' "$BODY" | jq -r '.[0].status' 2>/dev/null)
-            P2_STATUS=$(printf '%s' "$BODY" | jq -r '.[1].status' 2>/dev/null)
+            P1_STATUS=$(printf '%s' "$BODY" | jq -r '.[] | select(.def_step_id=="p1") | .status' 2>/dev/null | head -1)
+            P2_STATUS=$(printf '%s' "$BODY" | jq -r '.[] | select(.def_step_id=="p2") | .status' 2>/dev/null | head -1)
             if ([ "$P1_STATUS" = "ready" ] || [ "$P1_STATUS" = "running" ]) && \
                ([ "$P2_STATUS" = "ready" ] || [ "$P2_STATUS" = "running" ]); then
                 pass "Parallel strategy: all steps are ready/running"
