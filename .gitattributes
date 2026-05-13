@@ -1,13 +1,13 @@
+# Default: let git auto-detect text vs binary
+* text=auto
+
 # Ensure shell scripts and Dockerfiles are LF on every platform.
 # Without this, git on Windows checks them out with CRLF and Docker
 # builds (alpine bash) fail with errors like:
 #   /tmp/install-zig.sh: line 2: set: pipefail: invalid option name
 # because the trailing \r corrupts shell built-in option parsing.
 
-*.sh        text eol=lf
-*.bash      text eol=lf
-Dockerfile  text eol=lf
+*.sh         text eol=lf
+*.bash       text eol=lf
+Dockerfile   text eol=lf
 *.dockerfile text eol=lf
-
-# Default: let git auto-detect text vs binary
-* text=auto
