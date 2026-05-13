@@ -50,6 +50,54 @@ pub const WorkflowDef = struct {
 
 pub const WorkflowMap = std.StringArrayHashMapUnmanaged(WorkflowDef);
 
+pub const WorkflowDiagnosticSeverity = enum {
+    @"error",
+    warning,
+};
+
+pub const WorkflowDiagnostic = struct {
+    severity: WorkflowDiagnosticSeverity,
+    file_path: []const u8,
+    message: []const u8,
+    field: ?[]const u8 = null,
+};
+
+pub const WorkflowFileStatus = struct {
+    file_path: []const u8,
+    pipeline_id: []const u8,
+    has_error: bool,
+};
+
+pub const WorkflowValidationResult = struct {
+    checked_files: usize = 0,
+    valid_files: usize = 0,
+    error_count: usize = 0,
+    warning_count: usize = 0,
+    diagnostics: []WorkflowDiagnostic = &.{},
+    files: []WorkflowFileStatus = &.{},
+};
+
+fn appendWorkflowDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayListUnmanaged(WorkflowDiagnostic),
+    result: *WorkflowValidationResult,
+    severity: WorkflowDiagnosticSeverity,
+    file_path: []const u8,
+    field: ?[]const u8,
+    message: []const u8,
+) !void {
+    try diagnostics.append(allocator, .{
+        .severity = severity,
+        .file_path = file_path,
+        .message = message,
+        .field = field,
+    });
+    switch (severity) {
+        .@"error" => result.error_count += 1,
+        .warning => result.warning_count += 1,
+    }
+}
+
 // ── loadWorkflows ─────────────────────────────────────────────────────
 
 pub fn loadWorkflows(allocator: std.mem.Allocator, dir_path: []const u8) WorkflowMap {
@@ -66,7 +114,7 @@ pub fn loadWorkflows(allocator: std.mem.Allocator, dir_path: []const u8) Workflo
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const contents = dir.readFileAlloc(allocator, entry.name, 1024 * 1024) catch continue;
-        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{ .ignore_unknown_fields = true }) catch continue;
         const def = parsed.value;
 
         if (def.pipeline_id.len == 0) continue;
@@ -75,6 +123,201 @@ pub fn loadWorkflows(allocator: std.mem.Allocator, dir_path: []const u8) Workflo
     }
 
     return map;
+}
+
+// ── validateWorkflowFiles ─────────────────────────────────────────────
+
+/// Validate file-based tracker/pull-mode WorkflowDef JSON files without
+/// changing loadWorkflows runtime semantics.
+pub fn validateWorkflowFiles(allocator: std.mem.Allocator, dir_path: []const u8) !WorkflowValidationResult {
+    var result = WorkflowValidationResult{};
+    var diagnostics: std.ArrayListUnmanaged(WorkflowDiagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var files: std.ArrayListUnmanaged(WorkflowFileStatus) = .empty;
+    defer files.deinit(allocator);
+
+    var seen_pipeline_files = std.StringHashMap([]const u8).init(allocator);
+    defer seen_pipeline_files.deinit();
+
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        std_compat.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch {
+            const path = try allocator.dupe(u8, dir_path);
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                path,
+                null,
+                "workflow directory is missing or unreadable",
+            );
+            result.files = try files.toOwnedSlice(allocator);
+            result.diagnostics = try diagnostics.toOwnedSlice(allocator);
+            return result;
+        }
+    else
+        std_compat.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+            const path = try allocator.dupe(u8, dir_path);
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                path,
+                null,
+                "workflow directory is missing or unreadable",
+            );
+            result.files = try files.toOwnedSlice(allocator);
+            result.diagnostics = try diagnostics.toOwnedSlice(allocator);
+            return result;
+        };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+        result.checked_files += 1;
+        var file_has_error = false;
+        const file_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+
+        const contents = dir.readFileAlloc(allocator, entry.name, 1024 * 1024) catch {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                file_path,
+                null,
+                "workflow file is unreadable",
+            );
+            continue;
+        };
+        defer allocator.free(contents);
+
+        const raw_json = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                file_path,
+                null,
+                "invalid workflow JSON",
+            );
+            continue;
+        };
+        raw_json.deinit();
+
+        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{ .ignore_unknown_fields = true }) catch {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                file_path,
+                null,
+                "JSON does not match file-based WorkflowDef shape",
+            );
+            continue;
+        };
+        defer parsed.deinit();
+        const def = parsed.value;
+
+        if (def.pipeline_id.len == 0) {
+            file_has_error = true;
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                file_path,
+                "pipeline_id",
+                "pipeline_id is missing or empty",
+            );
+        } else if (seen_pipeline_files.get(def.pipeline_id)) |first_file| {
+            file_has_error = true;
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "duplicate pipeline_id '{s}' also used by {s}",
+                .{ def.pipeline_id, first_file },
+            );
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .@"error",
+                file_path,
+                "pipeline_id",
+                msg,
+            );
+        } else {
+            try seen_pipeline_files.put(try allocator.dupe(u8, def.pipeline_id), file_path);
+        }
+
+        if (def.id.len == 0) {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .warning,
+                file_path,
+                "id",
+                "id is empty",
+            );
+        }
+
+        if (def.claim_roles.len == 0) {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .warning,
+                file_path,
+                "claim_roles",
+                "claim_roles is empty",
+            );
+        }
+
+        if (def.execution == .dispatch and def.dispatch.worker_tags.len == 0) {
+            try appendWorkflowDiagnostic(
+                allocator,
+                &diagnostics,
+                &result,
+                .warning,
+                file_path,
+                "dispatch.worker_tags",
+                "dispatch workflow has no worker_tags",
+            );
+        }
+
+        if (!file_has_error) {
+            result.valid_files += 1;
+        }
+        try files.append(allocator, .{
+            .file_path = file_path,
+            .pipeline_id = if (def.pipeline_id.len == 0) "" else try allocator.dupe(u8, def.pipeline_id),
+            .has_error = file_has_error,
+        });
+    }
+
+    if (result.checked_files == 0) {
+        const path = try allocator.dupe(u8, dir_path);
+        try appendWorkflowDiagnostic(
+            allocator,
+            &diagnostics,
+            &result,
+            .warning,
+            path,
+            null,
+            "directory contains no JSON workflow files",
+        );
+    }
+
+    result.files = try files.toOwnedSlice(allocator);
+    result.diagnostics = try diagnostics.toOwnedSlice(allocator);
+    return result;
 }
 
 test "loadWorkflows: supports absolute workflow directories" {
@@ -310,6 +553,42 @@ test "loadWorkflows: loads JSON files from directory" {
     try std.testing.expectEqualStrings("deploy", dep.dispatch.worker_tags[0]);
 }
 
+test "loadWorkflows: ignores unknown fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "forward.json",
+        .data =
+        \\{
+        \\  "id": "wf-forward",
+        \\  "pipeline_id": "forward",
+        \\  "claim_roles": ["coder"],
+        \\  "future_workflow_field": true,
+        \\  "subprocess": {
+        \\    "command": "nullclaw",
+        \\    "future_subprocess_field": "ignored"
+        \\  },
+        \\  "dispatch": {
+        \\    "worker_tags": ["coder"],
+        \\    "future_dispatch_field": "ignored"
+        \\  }
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const map = loadWorkflows(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+    try std.testing.expectEqualStrings("wf-forward", map.get("forward").?.id);
+    try std.testing.expectEqualStrings("nullclaw", map.get("forward").?.subprocess.command);
+}
+
 test "loadWorkflows: skips files with empty pipeline_id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -398,6 +677,202 @@ test "parse workflow with continuation_prompt" {
     const parsed = try std.json.parseFromSlice(WorkflowDef, allocator, json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqualStrings("Continue: attempt #{{attempt}}", parsed.value.subprocess.continuation_prompt.?);
+}
+
+test "validateWorkflowFiles: valid workflow directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "valid.json",
+        .data =
+        \\{
+        \\  "id": "wf-valid",
+        \\  "pipeline_id": "pipeline-valid",
+        \\  "claim_roles": ["developer"]
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.valid_files);
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+    try std.testing.expectEqual(@as(usize, 0), result.warning_count);
+    try std.testing.expectEqual(@as(usize, 1), result.files.len);
+    try std.testing.expectEqualStrings("pipeline-valid", result.files[0].pipeline_id);
+}
+
+test "validateWorkflowFiles: ignores unknown fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "forward.json",
+        .data =
+        \\{
+        \\  "id": "wf-forward",
+        \\  "pipeline_id": "pipeline-forward",
+        \\  "claim_roles": ["developer"],
+        \\  "future_workflow_field": true,
+        \\  "retry": {
+        \\    "max_attempts": 2,
+        \\    "future_retry_field": "ignored"
+        \\  }
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.valid_files);
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+}
+
+test "validateWorkflowFiles: malformed JSON is an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "broken.json",
+        .data = "{bad json",
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.error_count);
+    try std.testing.expectEqualStrings("invalid workflow JSON", result.diagnostics[0].message);
+}
+
+test "validateWorkflowFiles: missing or empty pipeline_id is an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "missing.json",
+        .data = "{\"id\":\"wf-missing\",\"claim_roles\":[\"dev\"]}",
+    });
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "empty.json",
+        .data = "{\"id\":\"wf-empty\",\"pipeline_id\":\"\",\"claim_roles\":[\"dev\"]}",
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 2), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 2), result.error_count);
+    for (result.diagnostics) |diag| {
+        if (diag.severity == .@"error") {
+            try std.testing.expectEqualStrings("pipeline_id", diag.field.?);
+        }
+    }
+}
+
+test "validateWorkflowFiles: duplicate pipeline_id is an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "first.json",
+        .data = "{\"id\":\"wf-a\",\"pipeline_id\":\"pipeline-dup\",\"claim_roles\":[\"dev\"]}",
+    });
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "second.json",
+        .data = "{\"id\":\"wf-b\",\"pipeline_id\":\"pipeline-dup\",\"claim_roles\":[\"reviewer\"]}",
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 2), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.error_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "duplicate pipeline_id") != null);
+}
+
+test "validateWorkflowFiles: missing directory is an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), "nonexistent_workflow_dir_xyz_999");
+    try std.testing.expectEqual(@as(usize, 0), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.error_count);
+    try std.testing.expectEqualStrings("workflow directory is missing or unreadable", result.diagnostics[0].message);
+}
+
+test "validateWorkflowFiles: empty claim_roles is a warning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "warn.json",
+        .data = "{\"id\":\"wf-warn\",\"pipeline_id\":\"pipeline-warn\"}",
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+    try std.testing.expectEqual(@as(usize, 1), result.warning_count);
+    try std.testing.expectEqualStrings("claim_roles", result.diagnostics[0].field.?);
+}
+
+test "validateWorkflowFiles: dispatch without worker_tags is a warning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "dispatch.json",
+        .data =
+        \\{
+        \\  "id": "wf-dispatch",
+        \\  "pipeline_id": "pipeline-dispatch",
+        \\  "claim_roles": ["dev"],
+        \\  "execution": "dispatch"
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
+    try std.testing.expectEqual(@as(usize, 1), result.warning_count);
+    try std.testing.expectEqualStrings("dispatch.worker_tags", result.diagnostics[0].field.?);
 }
 
 test "WorkflowWatcher: detects file changes" {
