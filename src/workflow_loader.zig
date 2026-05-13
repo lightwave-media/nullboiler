@@ -114,7 +114,7 @@ pub fn loadWorkflows(allocator: std.mem.Allocator, dir_path: []const u8) Workflo
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const contents = dir.readFileAlloc(allocator, entry.name, 1024 * 1024) catch continue;
-        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{ .ignore_unknown_fields = true }) catch continue;
         const def = parsed.value;
 
         if (def.pipeline_id.len == 0) continue;
@@ -210,7 +210,7 @@ pub fn validateWorkflowFiles(allocator: std.mem.Allocator, dir_path: []const u8)
         };
         raw_json.deinit();
 
-        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{}) catch {
+        const parsed = std.json.parseFromSlice(WorkflowDef, allocator, contents, .{ .ignore_unknown_fields = true }) catch {
             try appendWorkflowDiagnostic(
                 allocator,
                 &diagnostics,
@@ -553,6 +553,42 @@ test "loadWorkflows: loads JSON files from directory" {
     try std.testing.expectEqualStrings("deploy", dep.dispatch.worker_tags[0]);
 }
 
+test "loadWorkflows: ignores unknown fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "forward.json",
+        .data =
+        \\{
+        \\  "id": "wf-forward",
+        \\  "pipeline_id": "forward",
+        \\  "claim_roles": ["coder"],
+        \\  "future_workflow_field": true,
+        \\  "subprocess": {
+        \\    "command": "nullclaw",
+        \\    "future_subprocess_field": "ignored"
+        \\  },
+        \\  "dispatch": {
+        \\    "worker_tags": ["coder"],
+        \\    "future_dispatch_field": "ignored"
+        \\  }
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const map = loadWorkflows(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+    try std.testing.expectEqualStrings("wf-forward", map.get("forward").?.id);
+    try std.testing.expectEqualStrings("nullclaw", map.get("forward").?.subprocess.command);
+}
+
 test "loadWorkflows: skips files with empty pipeline_id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -671,6 +707,38 @@ test "validateWorkflowFiles: valid workflow directory" {
     try std.testing.expectEqual(@as(usize, 0), result.warning_count);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
     try std.testing.expectEqualStrings("pipeline-valid", result.files[0].pipeline_id);
+}
+
+test "validateWorkflowFiles: ignores unknown fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "forward.json",
+        .data =
+        \\{
+        \\  "id": "wf-forward",
+        \\  "pipeline_id": "pipeline-forward",
+        \\  "claim_roles": ["developer"],
+        \\  "future_workflow_field": true,
+        \\  "retry": {
+        \\    "max_attempts": 2,
+        \\    "future_retry_field": "ignored"
+        \\  }
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try validateWorkflowFiles(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), result.checked_files);
+    try std.testing.expectEqual(@as(usize, 1), result.valid_files);
+    try std.testing.expectEqual(@as(usize, 0), result.error_count);
 }
 
 test "validateWorkflowFiles: malformed JSON is an error" {
