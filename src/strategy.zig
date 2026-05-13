@@ -39,7 +39,7 @@ pub fn loadStrategies(allocator: std.mem.Allocator, dir_path: []const u8) Strate
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
         const contents = dir.readFileAlloc(allocator, entry.name, 1024 * 1024) catch continue;
-        const parsed = std.json.parseFromSlice(Strategy, allocator, contents, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(Strategy, allocator, contents, .{ .ignore_unknown_fields = true }) catch continue;
         const strategy = parsed.value;
 
         map.put(allocator, strategy.name, strategy) catch continue;
@@ -270,6 +270,33 @@ test "loadStrategies: loads from directory" {
 
     const par = map.get("mypar").?;
     try std.testing.expectEqualStrings("independent", par.build);
+}
+
+test "loadStrategies: ignores unknown fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "future.json",
+        .data =
+        \\{
+        \\  "name": "future",
+        \\  "description": "forward compatible",
+        \\  "build": "chain",
+        \\  "future_strategy_field": true
+        \\}
+        ,
+    });
+
+    const dir_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const map = loadStrategies(arena.allocator(), dir_path);
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+    try std.testing.expectEqualStrings("chain", map.get("future").?.build);
 }
 
 test "expandStrategy: passthrough when no strategy field" {

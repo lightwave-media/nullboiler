@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
 // ── Legacy validation (used by api.zig for POST /runs) ────────────────
@@ -8,6 +9,7 @@ pub const ValidateError = error{
     StepIdMissingOrNotString,
     StepIdEmpty,
     StepIdDuplicate,
+    StepTypeUnknown,
     DependsOnNotArray,
     DependsOnItemNotString,
     DependsOnDuplicate,
@@ -60,9 +62,8 @@ fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn validateStepTypeRules(step_type: []const u8, step_obj: std.json.ObjectMap) ValidateError!void {
-    // No specific rules for current step types (task, route, interrupt, agent, send, transform, subgraph)
-    _ = step_type;
     _ = step_obj;
+    if (types.StepType.fromString(step_type) == null) return error.StepTypeUnknown;
 }
 
 fn validateDependsOnTypes(allocator: std.mem.Allocator, step_obj: std.json.ObjectMap) ValidateError!void {
@@ -634,6 +635,19 @@ test "validateStepsForCreateRun: rejects duplicate ids" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
     try std.testing.expectError(error.StepIdDuplicate, validateStepsForCreateRun(allocator, parsed.value.array.items));
+}
+
+test "validateStepsForCreateRun: rejects unknown step type" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\[
+        \\  {"id":"a","type":"wait"}
+        \\]
+    ;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.StepTypeUnknown, validateStepsForCreateRun(allocator, parsed.value.array.items));
 }
 
 test "validateStepsForCreateRun: rejects non-object step item" {
