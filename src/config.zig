@@ -122,7 +122,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
     // Do NOT free `contents` or deinit `parsed` here.
     // `Config` fields may point into these allocations.
     // The caller should provide an arena allocator and clean it up once on shutdown.
-    const parsed = try std.json.parseFromSlice(Config, allocator, contents, .{});
+    const parsed = try std.json.parseFromSlice(Config, allocator, contents, .{ .ignore_unknown_fields = true });
 
     return parsed.value;
 }
@@ -228,6 +228,72 @@ test "loadFromFile reads configured host and worker URL from JSON file" {
     try std.testing.expectEqualStrings("boiler-1", cfg.tracker.?.agent_id);
     try std.testing.expectEqual(@as(u32, 3), cfg.tracker.?.concurrency.max_concurrent_tasks);
     try std.testing.expectEqualStrings("workflows", cfg.tracker.?.workflows_dir);
+}
+
+test "loadFromFile ignores unknown fields at all config levels" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cfg_json =
+        \\{
+        \\  "host": "0.0.0.0",
+        \\  "future_top_level": true,
+        \\  "workers": [
+        \\    {
+        \\      "id": "w1",
+        \\      "url": "http://localhost:3000/webhook",
+        \\      "token": "tok",
+        \\      "future_worker": "ignored"
+        \\    }
+        \\  ],
+        \\  "engine": {
+        \\    "poll_interval_ms": 250,
+        \\    "future_engine": 42
+        \\  },
+        \\  "tracker": {
+        \\    "url": "http://127.0.0.1:7700",
+        \\    "future_tracker": true,
+        \\    "concurrency": {
+        \\      "max_concurrent_tasks": 2,
+        \\      "future_concurrency": 9
+        \\    },
+        \\    "workspace": {
+        \\      "root": "workspaces",
+        \\      "future_workspace": "ignored",
+        \\      "hooks": {
+        \\        "before_run": "echo ok",
+        \\        "future_hook": "ignored"
+        \\      }
+        \\    },
+        \\    "subprocess": {
+        \\      "command": "nullclaw",
+        \\      "future_subprocess": "ignored"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "config.json",
+        .data = cfg_json,
+    });
+
+    const cfg_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(cfg_path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cfg = try loadFromFile(arena.allocator(), cfg_path);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.host);
+    try std.testing.expectEqual(@as(usize, 1), cfg.workers.len);
+    try std.testing.expectEqualStrings("w1", cfg.workers[0].id);
+    try std.testing.expectEqual(@as(u32, 250), cfg.engine.poll_interval_ms);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7700", cfg.tracker.?.url.?);
+    try std.testing.expectEqual(@as(u32, 2), cfg.tracker.?.concurrency.max_concurrent_tasks);
+    try std.testing.expectEqualStrings("workspaces", cfg.tracker.?.workspace.root);
+    try std.testing.expectEqualStrings("echo ok", cfg.tracker.?.workspace.hooks.before_run.?);
+    try std.testing.expectEqualStrings("nullclaw", cfg.tracker.?.subprocess.command);
 }
 
 test "TrackerConfig defaults" {

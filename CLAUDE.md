@@ -15,7 +15,7 @@ Graph-based workflow orchestrator with unified state model for NullClaw AI bot a
 | File | Role |
 |------|------|
 | `main.zig` | CLI args (`--port`, `--db`, `--config`, `--version`, `--export-manifest`, `--from-json`), HTTP accept loop, engine thread, tracker thread |
-| `api.zig` | REST API routing and 30+ endpoint handlers (runs, workers, workflows, checkpoints, state, SSE stream, tracker) |
+| `api.zig` | REST API routing and 30+ endpoint handlers (runs, workers, workflows, checkpoints, state, stream snapshots, tracker) |
 | `store.zig` | SQLite layer, CRUD methods for all tables, schema migrations (4 migration files) |
 | `engine.zig` | Graph-based state scheduler: tick loop, 7 node type handlers, checkpoints, reducers, goto, breakpoints, deferred nodes, reconciliation |
 | `state.zig` | Unified state model: 7 reducer types (last_value, append, merge, add, min, max, add_messages), overwrite bypass, ephemeral keys, state path resolution |
@@ -46,7 +46,7 @@ Graph-based workflow orchestrator with unified state model for NullClaw AI bot a
 
 ```sh
 zig build              # build
-zig build test         # unit tests (320 tests)
+zig build test         # unit tests (355 tests)
 zig build && bash tests/test_e2e.sh   # e2e tests (requires Python 3 for mock workers)
 ./zig-out/bin/nullboiler --port 8080 --db nullboiler.db --config config.json
 ```
@@ -68,8 +68,8 @@ zig build && bash tests/test_e2e.sh   # e2e tests (requires Python 3 for mock wo
 | POST | `/workers` | Register worker |
 | GET | `/workers` | List workers |
 | DELETE | `/workers/{id}` | Remove worker |
-| POST | `/runs` | Create workflow run (legacy step-array or graph format) |
-| GET | `/runs` | List runs (supports ?status= filter) |
+| POST | `/runs` | Create workflow run from legacy step-array format |
+| GET | `/runs` | List runs (supports ?status= and ?workflow_id= filters) |
 | GET | `/runs/{id}` | Get run details |
 | POST | `/runs/{id}/cancel` | Cancel run |
 | POST | `/runs/{id}/retry` | Retry failed run |
@@ -82,7 +82,7 @@ zig build && bash tests/test_e2e.sh   # e2e tests (requires Python 3 for mock wo
 | GET | `/runs/{id}/events` | List run events |
 | GET | `/runs/{id}/checkpoints` | List checkpoints for run |
 | GET | `/runs/{id}/checkpoints/{cpId}` | Get checkpoint details |
-| GET | `/runs/{id}/stream` | SSE stream (supports ?mode=values\|updates\|tasks\|debug) |
+| GET | `/runs/{id}/stream` | JSON stream snapshot (supports ?mode=values\|updates\|tasks\|debug\|custom and ?after_seq=) |
 | POST | `/workflows` | Create workflow definition |
 | GET | `/workflows` | List workflow definitions |
 | GET | `/workflows/{id}` | Get workflow definition |
@@ -136,9 +136,12 @@ MQTT listener:     (conditional, for async MQTT workers)
 Redis listener:    (conditional, for async Redis workers)
 ```
 
-### SSE Streaming
+### Stream Snapshots
 
-5 modes for real-time consumption via `GET /runs/{id}/stream?mode=X`:
+`GET /runs/{id}/stream` currently returns a JSON snapshot containing persisted
+events and buffered in-memory stream events. It supports `mode=X` filtering and
+`after_seq=N` cursors for independent consumers. The internal stream hub uses 5
+modes:
 - `values` -- full state after each step
 - `updates` -- node name + partial state updates
 - `tasks` -- task start/finish with metadata

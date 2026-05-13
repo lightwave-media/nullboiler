@@ -232,7 +232,7 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return handleInjectState(ctx, seg1.?, body);
     }
 
-    // ── SSE stream endpoint ─────────────────────────────────────────
+    // ── Stream snapshot endpoint ────────────────────────────────────
 
     // GET /runs/{id}/stream
     if (is_get and eql(seg0, "runs") and seg1 != null and eql(seg2, "stream") and seg3 == null) {
@@ -1506,9 +1506,10 @@ fn handleForkRun(ctx: *Context, body: []const u8) HttpResponse {
     };
 
     const run_id_json = jsonQuoted(ctx.allocator, new_run_id) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
+    const checkpoint_id_json = jsonQuoted(ctx.allocator, checkpoint_id) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
     const resp = std.fmt.allocPrint(ctx.allocator,
         \\{{"id":{s},"status":"running","forked_from_checkpoint":{s}}}
-    , .{ run_id_json, checkpoint_id }) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
+    , .{ run_id_json, checkpoint_id_json }) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
     return jsonResponse(201, resp);
 }
 
@@ -1630,12 +1631,12 @@ fn handleInjectState(ctx: *Context, run_id: []const u8, body: []const u8) HttpRe
     }
 }
 
-// ── SSE Stream Handler ──────────────────────────────────────────────
+// ── Stream Snapshot Handler ─────────────────────────────────────────
 
 fn handleStream(ctx: *Context, run_id: []const u8, target: []const u8) HttpResponse {
     // For now, return the current state and events as a regular JSON response.
-    // Full SSE streaming with held-open connections will be implemented
-    // when the threading model is wired in main.zig (Task 12).
+    // Held-open SSE is handled internally by the hub; the HTTP endpoint
+    // returns snapshots so independent consumers can use after_seq cursors.
     //
     // Supports ?mode=values,tasks,debug,updates,custom query param to filter
     // which streaming modes the client wants. Default: all modes.
@@ -1959,6 +1960,7 @@ fn validationErrorResponse(err: workflow_validation.ValidateError) HttpResponse 
         error.StepIdMissingOrNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"each step must have string field 'id'\"}}"),
         error.StepIdEmpty => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"step id must not be empty\"}}"),
         error.StepIdDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"duplicate step id\"}}"),
+        error.StepTypeUnknown => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"unknown step type\"}}"),
         error.DependsOnNotArray => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on must be an array\"}}"),
         error.DependsOnItemNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on items must be strings\"}}"),
         error.DependsOnDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on contains duplicate step id\"}}"),
@@ -2374,6 +2376,26 @@ test "API: create run rejects duplicate depends_on items" {
     try std.testing.expectEqual(@as(u16, 400), resp.status_code);
 }
 
+test "API: create run rejects unknown step type" {
+    const allocator = std.testing.allocator;
+    var store = try Store.init(allocator, ":memory:");
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var ctx = Context{
+        .store = &store,
+        .allocator = arena.allocator(),
+    };
+
+    const body =
+        \\{"steps":[{"id":"legacy-wait","type":"wait"}]}
+    ;
+    const resp = handleRequest(&ctx, "POST", "/runs", body);
+    try std.testing.expectEqual(@as(u16, 400), resp.status_code);
+}
+
 test "API: get step enforces run ownership" {
     const allocator = std.testing.allocator;
     var store = try Store.init(allocator, ":memory:");
@@ -2644,6 +2666,30 @@ test "API: list runs supports workflow_id filter" {
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"workflow_id\":\"wf_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"workflow_id\":\"wf_2\"") == null);
+}
+
+test "API: fork run returns quoted checkpoint id" {
+    const allocator = std.testing.allocator;
+    var store = try Store.init(allocator, ":memory:");
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try store.createRunWithState("r1", null, "{\"nodes\":{}}", "{}", "{\"x\":1}");
+    try store.createCheckpoint("cp-one", "r1", "step_a", null, "{\"x\":1}", "[\"step_a\"]", 1, null);
+
+    var ctx = Context{
+        .store = &store,
+        .allocator = arena.allocator(),
+    };
+
+    const resp = handleRequest(&ctx, "POST", "/runs/fork", "{\"checkpoint_id\":\"cp-one\"}");
+    try std.testing.expectEqual(@as(u16, 201), resp.status_code);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("cp-one", parsed.value.object.get("forked_from_checkpoint").?.string);
 }
 
 test "API: replay run from checkpoint" {
