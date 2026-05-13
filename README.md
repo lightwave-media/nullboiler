@@ -105,7 +105,11 @@ zig build run -- validate-workflows workflows
 ```
 
 The command defaults to `workflows` and scans direct `*.json` files in the
-directory. It reports:
+directory, matching `loadWorkflows`; it does not recurse into nested directories.
+This is only for file-based tracker/pull-mode `WorkflowDef` files, not graph
+workflow definitions managed through the HTTP API.
+
+It reports:
 
 - errors for missing or unreadable directories, unreadable files, malformed JSON,
   JSON that cannot be parsed as `WorkflowDef`, missing or empty `pipeline_id`,
