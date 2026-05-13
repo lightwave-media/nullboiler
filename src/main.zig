@@ -539,12 +539,10 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
 
     var header_end: ?usize = null;
     var content_len: usize = 0;
-    var read_buffer: [request_read_chunk]u8 = undefined;
-    var reader = stream.reader(std_compat.io(), &read_buffer);
     var chunk: [request_read_chunk]u8 = undefined;
 
     while (true) {
-        const n = try reader.interface.readSliceShort(&chunk);
+        const n = try readStreamAvailable(stream, &chunk);
         if (n == 0) return null;
 
         try buffer.appendSlice(allocator, chunk[0..n]);
@@ -593,6 +591,14 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.Io.net.Stream, max
         .request_id = request_id,
         .traceparent = traceparent,
     };
+}
+
+fn readStreamAvailable(stream: *std.Io.net.Stream, buffer: []u8) std.Io.net.Stream.Reader.Error!usize {
+    // Reader.readSliceShort fills the whole buffer in Zig 0.16, which stalls
+    // small HTTP requests until the client closes the socket.
+    var slices = [_][]u8{buffer};
+    const io = std_compat.io();
+    return io.vtable.netRead(io.userdata, stream.socket.handle, &slices);
 }
 
 fn parseContentLength(headers_raw: []const u8) ?usize {
