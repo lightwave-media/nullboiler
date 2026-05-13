@@ -1,4 +1,4 @@
-# Prometheus AlertManager rules for NullBoiler.
+# Prometheus alerting rules for NullBoiler.
 #
 # Drop into your Prometheus config alongside the scrape stanza from
 # `dashboards/prometheus/prometheus.yml`:
@@ -6,8 +6,8 @@
 #   rule_files:
 #     - /etc/prometheus/alerts/nullboiler.rules.yml
 #
-# Then point AlertManager at the rules and route the `nullboiler` group
-# to your on-call channel.
+# Then configure Alertmanager routes for the `nullboiler` group and send
+# them to your on-call channel.
 #
 # These rules pair 1:1 with the panels in `dashboards/grafana/`. If you
 # tune a threshold here, mirror it in the corresponding dashboard panel

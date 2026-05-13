@@ -342,6 +342,20 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub fn countWorkersByStatus(self: *Self, status: []const u8) !i64 {
+        const sql = "SELECT COUNT(*) FROM workers WHERE status = ?";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_STATIC);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
     pub fn getWorker(self: *Self, allocator: std.mem.Allocator, id: []const u8) !?types.WorkerRow {
         const sql = "SELECT id, url, token, protocol, model, tags_json, max_concurrent, source, status, consecutive_failures, circuit_open_until_ms, last_error_text, last_health_ms, created_at_ms FROM workers WHERE id = ?";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -661,6 +675,20 @@ pub const Store = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub fn countRunsByStatus(self: *Self, status: []const u8) !i64 {
+        const sql = "SELECT COUNT(*) FROM runs WHERE status = ?";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_STATIC);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
     // ── Step CRUD ─────────────────────────────────────────────────────
 
     pub fn insertStep(self: *Self, id: []const u8, run_id: []const u8, def_step_id: []const u8, step_type: []const u8, status: []const u8, input_json: []const u8, max_attempts: i64, timeout_ms: ?i64, parent_step_id: ?[]const u8, item_index: ?i64) !void {
@@ -854,6 +882,20 @@ pub const Store = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, run_id.ptr, @intCast(run_id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, status.ptr, @intCast(status.len), SQLITE_STATIC);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return colInt(stmt, 0);
+    }
+
+    pub fn countAllStepsByStatus(self: *Self, status: []const u8) !i64 {
+        const sql = "SELECT COUNT(*) FROM steps WHERE status = ?";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_STATIC);
 
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
         return colInt(stmt, 0);

@@ -15,16 +15,17 @@ scrape_configs:
     metrics_path: /metrics
     scheme: http
     static_configs:
-      - targets: ["nullboiler:8080"]   # docker-compose service name
+      - targets: ["host.docker.internal:8080"]   # host NullBoiler from Docker sidecar
         labels:
           service: nullboiler
           env: local
 
-  # Uncomment when running outside docker-compose:
-  # - job_name: nullboiler-host
+  # Use this target instead when Prometheus and NullBoiler share a
+  # docker-compose network and the orchestrator service is named "nullboiler":
+  # - job_name: nullboiler-compose
   #   metrics_path: /metrics
   #   static_configs:
-  #     - targets: ["127.0.0.1:8080"]
+  #     - targets: ["nullboiler:8080"]
   #       labels:
   #         service: nullboiler
   #         env: local

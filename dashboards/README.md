@@ -30,7 +30,7 @@ dashboards/
 ├── prometheus/
 │   └── prometheus.yml                   minimal scrape config
 └── alerts/
-    └── nullboiler.rules.yml             8 AlertManager rules paired 1:1 with the dashboards
+    └── nullboiler.rules.yml             8 Prometheus alerting rules paired 1:1 with the dashboards
 ```
 
 ## What each dashboard answers
@@ -49,6 +49,10 @@ Open this first when investigating "is something wrong?".
 | Worker dispatch (success vs failure) | Stacked-area dispatch outcomes |
 | Callbacks (sent vs failed) | Webhook delivery reliability |
 | Reliability ratios | Idempotent replay ratio + step retry ratio with thresholds |
+| Runs in-flight | Current number of running workflow runs |
+| Steps in-flight | Current number of running steps |
+| Workers healthy | Workers currently marked `active` |
+| Drain mode | Whether the API is rejecting new runs for drain |
 
 ### `nullboiler-workers.json`
 
@@ -66,27 +70,33 @@ you need to localize the bad worker.
 
 ## Metrics exposed by NullBoiler
 
-From `src/metrics.zig`, all counters (no histograms or labels yet):
+From `src/metrics.zig` and the `GET /metrics` handler, all exported
+metrics (no histograms or labels yet):
 
-| Counter | Meaning |
-|---|---|
-| `nullboiler_http_requests_total` | All HTTP requests handled by the API |
-| `nullboiler_runs_created_total` | Runs successfully accepted by `POST /runs` |
-| `nullboiler_runs_idempotent_replays_total` | Idempotent replays of an existing run |
-| `nullboiler_steps_claimed_total` | Steps dispatched to workers |
-| `nullboiler_steps_retry_scheduled_total` | Steps scheduled for retry |
-| `nullboiler_worker_dispatch_success_total` | Worker dispatches that succeeded |
-| `nullboiler_worker_dispatch_failure_total` | Worker dispatches that failed |
-| `nullboiler_worker_health_checks_total` | Health probes performed |
-| `nullboiler_worker_health_failures_total` | Health probes that failed |
-| `nullboiler_callback_sent_total` | Run-lifecycle webhook callbacks sent |
-| `nullboiler_callback_failed_total` | Run-lifecycle webhook callbacks failed |
+| Metric | Type | Meaning |
+|---|---|---|
+| `nullboiler_http_requests_total` | counter | All HTTP requests handled by the API |
+| `nullboiler_runs_created_total` | counter | Runs successfully accepted by `POST /runs` |
+| `nullboiler_runs_idempotent_replays_total` | counter | Idempotent replays of an existing run |
+| `nullboiler_steps_claimed_total` | counter | Steps dispatched to workers |
+| `nullboiler_steps_retry_scheduled_total` | counter | Steps scheduled for retry |
+| `nullboiler_worker_dispatch_success_total` | counter | Worker dispatches that succeeded |
+| `nullboiler_worker_dispatch_failure_total` | counter | Worker dispatches that failed |
+| `nullboiler_worker_health_checks_total` | counter | Health probes performed |
+| `nullboiler_worker_health_failures_total` | counter | Health probes that failed |
+| `nullboiler_callback_sent_total` | counter | Run-lifecycle webhook callbacks sent |
+| `nullboiler_callback_failed_total` | counter | Run-lifecycle webhook callbacks failed |
+| `nullboiler_runs_in_flight` | gauge | Workflow runs currently in `running` status |
+| `nullboiler_steps_in_flight` | gauge | Steps currently in `running` status |
+| `nullboiler_workers_healthy` | gauge | Workers currently in `active` status |
+| `nullboiler_drain_mode` | gauge | `1` when drain mode is enabled, otherwise `0` |
 
-## Quick start (docker-compose)
+## Quick start (Docker sidecars)
 
 ```bash
 docker run -d --name prom \
   -p 9090:9090 \
+  --add-host=host.docker.internal:host-gateway \
   -v "$(pwd)/dashboards/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
   prom/prometheus
 
@@ -101,8 +111,11 @@ docker run -d --name grafana \
 ```
 
 Open Grafana at http://localhost:3030, point both dashboards at the
-Prometheus datasource, and they will populate as soon as NullBoiler
-starts handling traffic.
+Prometheus datasource, and they will populate as soon as a host
+NullBoiler process on port 8080 starts handling traffic. If Prometheus
+and NullBoiler run in the same docker-compose network, switch the
+target in `prometheus/prometheus.yml` to the commented
+`nullboiler:8080` example.
 
 ## Quick start (existing Prometheus + Grafana)
 
@@ -167,8 +180,9 @@ To smoke-test the metrics endpoint without Grafana:
 curl -s http://localhost:8080/metrics | head -30
 ```
 
-You should see eleven `# TYPE ... counter` blocks and their numeric
-values. Empty values are valid — counters start at zero.
+You should see fifteen `# TYPE ...` blocks and their numeric values.
+Empty values are valid — counters start at zero and gauges reflect the
+current store state.
 
 ## Diagnosing integration gaps
 
@@ -206,7 +220,7 @@ mitigate at runtime.
   unlabeled, a single bad worker pulling 1/N of dispatches produces a
   ~1/N failure ratio — below the 30% warning threshold for N ≥ 4.
   Per-worker labels resolve this.
-- Recording rules + Grafana-native alerting (the AlertManager rules
+- Recording rules + Grafana-native alerting (the Prometheus alerting rules
   in `alerts/` are the floor — a recording-rule layer would precompute
   the ratios and avoid PromQL duplication between dashboards and
   alerts).
