@@ -138,6 +138,14 @@ paths:
                 # TYPE nullboiler_runs_created_total counter
                 nullboiler_runs_created_total 42
                 # ... 9 more counters
+                # TYPE nullboiler_runs_in_flight gauge
+                nullboiler_runs_in_flight 2
+                # TYPE nullboiler_steps_in_flight gauge
+                nullboiler_steps_in_flight 5
+                # TYPE nullboiler_workers_healthy gauge
+                nullboiler_workers_healthy 3
+                # TYPE nullboiler_drain_mode gauge
+                nullboiler_drain_mode 0
 
   /admin/drain:
     post:

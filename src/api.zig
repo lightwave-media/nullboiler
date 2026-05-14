@@ -282,7 +282,13 @@ fn handleHealth(ctx: *Context) HttpResponse {
 
 fn handleMetrics(ctx: *Context) HttpResponse {
     const m = ctx.metrics orelse return plainResponse(200, "nullboiler_metrics_disabled 1\n");
-    const body = m.renderPrometheus(ctx.allocator) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
+    const gauges = metrics_mod.Metrics.GaugeSnapshot{
+        .runs_in_flight = ctx.store.countRunsByStatus("running") catch 0,
+        .steps_in_flight = ctx.store.countAllStepsByStatus("running") catch 0,
+        .workers_healthy = ctx.store.countWorkersByStatus("active") catch 0,
+        .drain_mode = if (ctx.drain_mode) |drain| @intFromBool(drain.load(.acquire)) else 0,
+    };
+    const body = m.renderPrometheusWithGauges(ctx.allocator, gauges) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
     return plainResponse(200, body);
 }
 
@@ -2632,16 +2638,26 @@ test "API: metrics endpoint returns text format" {
     defer arena.deinit();
 
     var metrics = metrics_mod.Metrics{};
+    var drain_mode = std.atomic.Value(bool).init(true);
+    try store.insertRun("run-active", null, "running", "{\"steps\":[]}", "{}", "[]");
+    try store.insertStep("step-active", "run-active", "node-a", "task", "running", "{}", 1, null, null, null);
+    try store.insertWorker("worker-active", "http://localhost:3000/webhook", "", "webhook", null, "[]", 1, "registered");
     var ctx = Context{
         .store = &store,
         .allocator = arena.allocator(),
         .metrics = &metrics,
+        .drain_mode = &drain_mode,
     };
 
     const resp = handleRequest(&ctx, "GET", "/metrics", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expect(std.mem.startsWith(u8, resp.content_type, "text/plain"));
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_http_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "# TYPE nullboiler_runs_in_flight gauge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_runs_in_flight 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_steps_in_flight 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_workers_healthy 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_drain_mode 1") != null);
 }
 
 test "API: list runs supports workflow_id filter" {
