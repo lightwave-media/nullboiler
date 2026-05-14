@@ -47,7 +47,7 @@ info:
     `POST /admin/drain` puts the orchestrator into drain mode. While
     draining, `POST /runs` returns `503` and existing runs continue to
     completion. Drain mode is process-local and resets on restart.
-  version: "2026.3.2"
+  version: "2026.3.3"
   license:
     name: MIT
     identifier: MIT
@@ -112,7 +112,7 @@ paths:
                 ok:
                   value:
                     status: ok
-                    version: "2026.3.2"
+                    version: "2026.3.3"
                     active_runs: 3
                     total_workers: 2
 
@@ -1179,7 +1179,7 @@ components:
           enum: [ok]
         version:
           type: string
-          example: "2026.3.2"
+          example: "2026.3.3"
         active_runs:
           type: integer
           format: int64
