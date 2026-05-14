@@ -5,6 +5,7 @@
 FROM --platform=$BUILDPLATFORM alpine:3.23 AS builder
 
 ARG ZIG_VERSION=0.16.0
+ARG VERSION=dev
 
 RUN apk add --no-cache bash curl musl-dev python3 tar xz
 
@@ -44,7 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
       arm64) zig_target="aarch64-linux-musl" ;; \
       *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
     esac; \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
 
 # -- Stage 2: Config Prep ----------------------------------------------------
 FROM busybox:1.37 AS config

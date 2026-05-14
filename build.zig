@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.2";
+
+    var build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
+    const build_options_module = build_options.createModule();
 
     const sqlite3_dep = b.dependency("sqlite3", .{
         .target = target,
@@ -33,6 +38,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(sqlite3_lib);
     exe.root_module.linkLibrary(hiredis_lib);
     exe.root_module.linkLibrary(mosquitto_lib);
+    exe.root_module.addImport("build_options", build_options_module);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -53,6 +59,7 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.root_module.linkLibrary(sqlite3_lib);
     exe_unit_tests.root_module.linkLibrary(hiredis_lib);
     exe_unit_tests.root_module.linkLibrary(mosquitto_lib);
+    exe_unit_tests.root_module.addImport("build_options", build_options_module);
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);

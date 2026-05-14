@@ -86,7 +86,7 @@ metrics (no histograms or labels yet):
 | `nullboiler_worker_health_failures_total` | counter | Health probes that failed |
 | `nullboiler_callback_sent_total` | counter | Run-lifecycle webhook callbacks sent |
 | `nullboiler_callback_failed_total` | counter | Run-lifecycle webhook callbacks failed |
-| `nullboiler_runs_in_flight` | gauge | Workflow runs currently in `running` status |
+| `nullboiler_runs_in_flight` | gauge | Workflow runs currently in `pending` or `running` status |
 | `nullboiler_steps_in_flight` | gauge | Steps currently in `running` status |
 | `nullboiler_workers_healthy` | gauge | Workers currently in `active` status |
 | `nullboiler_drain_mode` | gauge | `1` when drain mode is enabled, otherwise `0` |

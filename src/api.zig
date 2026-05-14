@@ -11,6 +11,7 @@ const config_mod = @import("config.zig");
 const sse_mod = @import("sse.zig");
 const state_mod = @import("state.zig");
 const engine_mod = @import("engine.zig");
+const app_version = @import("version.zig").string;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -261,29 +262,34 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
 fn handleHealth(ctx: *Context) HttpResponse {
     // Count active runs
     const active_runs = ctx.store.getActiveRuns(ctx.allocator) catch {
-        return jsonResponse(200, "{\"status\":\"ok\",\"version\":\"2026.3.2\",\"active_runs\":0,\"total_workers\":0}");
+        const resp = std.fmt.allocPrint(ctx.allocator,
+            \\{{"status":"ok","version":"{s}","active_runs":0,"total_workers":0}}
+        , .{app_version}) catch return jsonResponse(200, "{\"status\":\"ok\"}");
+        return jsonResponse(200, resp);
     };
     const active_count = active_runs.len;
 
     // Count total workers
     const workers = ctx.store.listWorkers(ctx.allocator) catch {
         const resp = std.fmt.allocPrint(ctx.allocator,
-            \\{{"status":"ok","version":"2026.3.2","active_runs":{d},"total_workers":0}}
-        , .{active_count}) catch return jsonResponse(200, "{\"status\":\"ok\",\"version\":\"2026.3.2\"}");
+            \\{{"status":"ok","version":"{s}","active_runs":{d},"total_workers":0}}
+        , .{ app_version, active_count }) catch return jsonResponse(200, "{\"status\":\"ok\"}");
         return jsonResponse(200, resp);
     };
     const worker_count = workers.len;
 
     const resp = std.fmt.allocPrint(ctx.allocator,
-        \\{{"status":"ok","version":"2026.3.2","active_runs":{d},"total_workers":{d}}}
-    , .{ active_count, worker_count }) catch return jsonResponse(200, "{\"status\":\"ok\",\"version\":\"2026.3.2\"}");
+        \\{{"status":"ok","version":"{s}","active_runs":{d},"total_workers":{d}}}
+    , .{ app_version, active_count, worker_count }) catch return jsonResponse(200, "{\"status\":\"ok\"}");
     return jsonResponse(200, resp);
 }
 
 fn handleMetrics(ctx: *Context) HttpResponse {
     const m = ctx.metrics orelse return plainResponse(200, "nullboiler_metrics_disabled 1\n");
+    const running_runs = ctx.store.countRunsByStatus("running") catch 0;
+    const pending_runs = ctx.store.countRunsByStatus("pending") catch 0;
     const gauges = metrics_mod.Metrics.GaugeSnapshot{
-        .runs_in_flight = ctx.store.countRunsByStatus("running") catch 0,
+        .runs_in_flight = running_runs + pending_runs,
         .steps_in_flight = ctx.store.countAllStepsByStatus("running") catch 0,
         .workers_healthy = ctx.store.countWorkersByStatus("active") catch 0,
         .drain_mode = if (ctx.drain_mode) |drain| @intFromBool(drain.load(.acquire)) else 0,
@@ -2640,6 +2646,7 @@ test "API: metrics endpoint returns text format" {
     var metrics = metrics_mod.Metrics{};
     var drain_mode = std.atomic.Value(bool).init(true);
     try store.insertRun("run-active", null, "running", "{\"steps\":[]}", "{}", "[]");
+    try store.insertRun("run-pending", null, "pending", "{\"steps\":[]}", "{}", "[]");
     try store.insertStep("step-active", "run-active", "node-a", "task", "running", "{}", 1, null, null, null);
     try store.insertWorker("worker-active", "http://localhost:3000/webhook", "", "webhook", null, "[]", 1, "registered");
     var ctx = Context{
@@ -2654,7 +2661,7 @@ test "API: metrics endpoint returns text format" {
     try std.testing.expect(std.mem.startsWith(u8, resp.content_type, "text/plain"));
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_http_requests_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "# TYPE nullboiler_runs_in_flight gauge") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_runs_in_flight 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_runs_in_flight 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_steps_in_flight 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_workers_healthy 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_drain_mode 1") != null);
