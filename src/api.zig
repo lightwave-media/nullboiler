@@ -232,7 +232,7 @@ pub fn handleRequest(ctx: *Context, method: []const u8, target: []const u8, body
         return handleInjectState(ctx, seg1.?, body);
     }
 
-    // ── SSE stream endpoint ─────────────────────────────────────────
+    // ── Stream snapshot endpoint ────────────────────────────────────
 
     // GET /runs/{id}/stream
     if (is_get and eql(seg0, "runs") and seg1 != null and eql(seg2, "stream") and seg3 == null) {
@@ -282,25 +282,16 @@ fn handleHealth(ctx: *Context) HttpResponse {
 
 fn handleMetrics(ctx: *Context) HttpResponse {
     const m = ctx.metrics orelse return plainResponse(200, "nullboiler_metrics_disabled 1\n");
-    const sample = computeGaugeSample(ctx);
-    const body = m.renderPrometheusWithSample(ctx.allocator, sample) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
-    return plainResponse(200, body);
-}
-
-/// Sample live "right now" values for the gauge metrics. Each helper falls
-/// back to 0 on error so a flaky DB query never poisons the entire /metrics
-/// response — the counter half stays valid.
-fn computeGaugeSample(ctx: *Context) metrics_mod.Metrics.Sample {
-    const drain_value: i64 = if (ctx.drain_mode) |d|
-        (if (d.load(.acquire)) @as(i64, 1) else @as(i64, 0))
-    else
-        0;
-    return .{
-        .runs_in_flight = ctx.store.countRunsInFlight() catch 0,
-        .steps_in_flight = ctx.store.countStepsRunning() catch 0,
+    const running_runs = ctx.store.countRunsByStatus("running") catch 0;
+    const pending_runs = ctx.store.countRunsByStatus("pending") catch 0;
+    const gauges = metrics_mod.Metrics.GaugeSnapshot{
+        .runs_in_flight = running_runs + pending_runs,
+        .steps_in_flight = ctx.store.countAllStepsByStatus("running") catch 0,
         .workers_healthy = ctx.store.countWorkersByStatus("active") catch 0,
-        .drain_mode = drain_value,
+        .drain_mode = if (ctx.drain_mode) |drain| @intFromBool(drain.load(.acquire)) else 0,
     };
+    const body = m.renderPrometheusWithGauges(ctx.allocator, gauges) catch return plainResponse(500, "nullboiler_metrics_render_error 1\n");
+    return plainResponse(200, body);
 }
 
 fn handleEnableDrain(ctx: *Context) HttpResponse {
@@ -1523,9 +1514,10 @@ fn handleForkRun(ctx: *Context, body: []const u8) HttpResponse {
     };
 
     const run_id_json = jsonQuoted(ctx.allocator, new_run_id) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
+    const checkpoint_id_json = jsonQuoted(ctx.allocator, checkpoint_id) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
     const resp = std.fmt.allocPrint(ctx.allocator,
         \\{{"id":{s},"status":"running","forked_from_checkpoint":{s}}}
-    , .{ run_id_json, checkpoint_id }) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
+    , .{ run_id_json, checkpoint_id_json }) catch return jsonResponse(500, "{\"error\":{\"code\":\"internal\",\"message\":\"out of memory\"}}");
     return jsonResponse(201, resp);
 }
 
@@ -1647,12 +1639,12 @@ fn handleInjectState(ctx: *Context, run_id: []const u8, body: []const u8) HttpRe
     }
 }
 
-// ── SSE Stream Handler ──────────────────────────────────────────────
+// ── Stream Snapshot Handler ─────────────────────────────────────────
 
 fn handleStream(ctx: *Context, run_id: []const u8, target: []const u8) HttpResponse {
     // For now, return the current state and events as a regular JSON response.
-    // Full SSE streaming with held-open connections will be implemented
-    // when the threading model is wired in main.zig (Task 12).
+    // Held-open SSE is handled internally by the hub; the HTTP endpoint
+    // returns snapshots so independent consumers can use after_seq cursors.
     //
     // Supports ?mode=values,tasks,debug,updates,custom query param to filter
     // which streaming modes the client wants. Default: all modes.
@@ -1976,6 +1968,7 @@ fn validationErrorResponse(err: workflow_validation.ValidateError) HttpResponse 
         error.StepIdMissingOrNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"each step must have string field 'id'\"}}"),
         error.StepIdEmpty => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"step id must not be empty\"}}"),
         error.StepIdDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"duplicate step id\"}}"),
+        error.StepTypeUnknown => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"unknown step type\"}}"),
         error.DependsOnNotArray => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on must be an array\"}}"),
         error.DependsOnItemNotString => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on items must be strings\"}}"),
         error.DependsOnDuplicate => jsonResponse(400, "{\"error\":{\"code\":\"bad_request\",\"message\":\"depends_on contains duplicate step id\"}}"),
@@ -2391,6 +2384,26 @@ test "API: create run rejects duplicate depends_on items" {
     try std.testing.expectEqual(@as(u16, 400), resp.status_code);
 }
 
+test "API: create run rejects unknown step type" {
+    const allocator = std.testing.allocator;
+    var store = try Store.init(allocator, ":memory:");
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var ctx = Context{
+        .store = &store,
+        .allocator = arena.allocator(),
+    };
+
+    const body =
+        \\{"steps":[{"id":"legacy-wait","type":"wait"}]}
+    ;
+    const resp = handleRequest(&ctx, "POST", "/runs", body);
+    try std.testing.expectEqual(@as(u16, 400), resp.status_code);
+}
+
 test "API: get step enforces run ownership" {
     const allocator = std.testing.allocator;
     var store = try Store.init(allocator, ":memory:");
@@ -2627,16 +2640,27 @@ test "API: metrics endpoint returns text format" {
     defer arena.deinit();
 
     var metrics = metrics_mod.Metrics{};
+    var drain_mode = std.atomic.Value(bool).init(true);
+    try store.insertRun("run-active", null, "running", "{\"steps\":[]}", "{}", "[]");
+    try store.insertRun("run-pending", null, "pending", "{\"steps\":[]}", "{}", "[]");
+    try store.insertStep("step-active", "run-active", "node-a", "task", "running", "{}", 1, null, null, null);
+    try store.insertWorker("worker-active", "http://localhost:3000/webhook", "", "webhook", null, "[]", 1, "registered");
     var ctx = Context{
         .store = &store,
         .allocator = arena.allocator(),
         .metrics = &metrics,
+        .drain_mode = &drain_mode,
     };
 
     const resp = handleRequest(&ctx, "GET", "/metrics", "");
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expect(std.mem.startsWith(u8, resp.content_type, "text/plain"));
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_http_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "# TYPE nullboiler_runs_in_flight gauge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_runs_in_flight 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_steps_in_flight 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_workers_healthy 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "nullboiler_drain_mode 1") != null);
 }
 
 test "API: list runs supports workflow_id filter" {
@@ -2661,6 +2685,30 @@ test "API: list runs supports workflow_id filter" {
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"workflow_id\":\"wf_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"workflow_id\":\"wf_2\"") == null);
+}
+
+test "API: fork run returns quoted checkpoint id" {
+    const allocator = std.testing.allocator;
+    var store = try Store.init(allocator, ":memory:");
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try store.createRunWithState("r1", null, "{\"nodes\":{}}", "{}", "{\"x\":1}");
+    try store.createCheckpoint("cp-one", "r1", "step_a", null, "{\"x\":1}", "[\"step_a\"]", 1, null);
+
+    var ctx = Context{
+        .store = &store,
+        .allocator = arena.allocator(),
+    };
+
+    const resp = handleRequest(&ctx, "POST", "/runs/fork", "{\"checkpoint_id\":\"cp-one\"}");
+    try std.testing.expectEqual(@as(u16, 201), resp.status_code);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("cp-one", parsed.value.object.get("forked_from_checkpoint").?.string);
 }
 
 test "API: replay run from checkpoint" {

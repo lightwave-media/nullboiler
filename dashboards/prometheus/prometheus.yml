@@ -1,0 +1,31 @@
+# Minimal Prometheus scrape config for a local NullBoiler instance.
+# Drop into your existing Prometheus alongside other scrape jobs.
+#
+# Pair with the Grafana dashboards in ../grafana/.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: nullboiler-local
+
+scrape_configs:
+  - job_name: nullboiler
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["host.docker.internal:8080"]   # host NullBoiler from Docker sidecar
+        labels:
+          service: nullboiler
+          env: local
+
+  # Use this target instead when Prometheus and NullBoiler share a
+  # docker-compose network and the orchestrator service is named "nullboiler":
+  # - job_name: nullboiler-compose
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["nullboiler:8080"]
+  #       labels:
+  #         service: nullboiler
+  #         env: local
