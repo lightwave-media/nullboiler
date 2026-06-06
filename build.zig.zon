@@ -1,7 +1,7 @@
 .{
     .name = .nullboiler,
     .fingerprint = 0xa2fe02b8f872821f,
-    .version = "2026.3.2",
+    .version = "2026.5.29",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .sqlite3 = .{
