@@ -2,12 +2,10 @@
   "id": "converge-review",
   "pipeline_id": "pipeline-converge-review",
   "claim_roles": ["v_staff-engineer", "v_cto"],
-  "execution": "subprocess",
-  "subprocess": {
-    "command": "nullclaw",
-    "args": ["--single-task"],
-    "max_turns": 20,
-    "turn_timeout_ms": 600000
+  "execution": "dispatch",
+  "dispatch": {
+    "protocol": "webhook",
+    "worker_tags": ["nullclaw", "reviewer"]
   },
   "prompt_template": "You are {{task.agent_role}}. Review the diff in this workspace per your hard rules and the code-review skill.\n\nTask: {{task.title}}\n{{task.description}}\n\nOutput findings by severity (🔴 blocker / 🟡 concern / ✅ pass). End with EXACTLY one machine-parsed line, nothing after it:\nCONVERGE-VERDICT: blockers=<count of your 🔴 findings; 0 if none>",
   "on_success": { "transition_to": "" },
