@@ -47,6 +47,10 @@ pub const RunningTask = struct {
     state: types.TrackerTaskState,
     health_retries: u32 = 0,
     attempt_count: u32 = 1,
+    /// Parsed `CONVERGE-VERDICT: blockers=N` from the reviewer's output (dispatch
+    /// mode). null = no verdict parsed yet, or a degraded review with no
+    /// well-formed verdict line → the converge trigger selection fails closed.
+    verdict_blockers: ?i64 = null,
 };
 
 // ── CooldownEntry ──────────────────────────────────────────────────
@@ -1006,6 +1010,16 @@ pub const Tracker = struct {
         ) catch "{}";
         _ = client.postEvent(task.run_id, "dispatch_completed", event_data, task.lease_token) catch {};
 
+        // Converge: parse the reviewer's CONVERGE-VERDICT and post it as the
+        // verdict event the nulltickets gate evaluates. A null result (no
+        // parseable verdict) posts nothing, so the gate has no clean verdict to
+        // satisfy and the advance transition fails closed.
+        task.verdict_blockers = parseConvergeVerdict(result.output);
+        if (task.verdict_blockers) |b| {
+            const verdict_data = std.fmt.allocPrint(tick_alloc, "{{\"blockers\":{d}}}", .{b}) catch "{}";
+            _ = client.postEvent(task.run_id, "verdict", verdict_data, task.lease_token) catch {};
+        }
+
         task.state = .completing;
         self.driveCompleting(tick_alloc, task);
     }
@@ -1179,6 +1193,17 @@ pub const Tracker = struct {
     }
 
     fn resolveSuccessTrigger(self: *Tracker, tick_alloc: std.mem.Allocator, task: *RunningTask) ![]const u8 {
+        // Converge tasks carry a parsed verdict; pick the gated trigger from the
+        // current stage's available transitions (block on blockers>0, the advance
+        // otherwise). A null verdict on a task that ran a converge review is a
+        // degraded review — return MissingSuccessTrigger so driveCompleting fails
+        // the task (fail-closed) instead of guessing a transition.
+        if (task.verdict_blockers != null) {
+            var client = tracker_client.TrackerClient.init(tick_alloc, self.cfg.url orelse "", self.cfg.api_token);
+            const info = (try client.getTask(task.task_id)) orelse return error.MissingSuccessTrigger;
+            return selectConvergeTrigger(task.verdict_blockers, info.available_transitions) orelse error.MissingSuccessTrigger;
+        }
+
         if (self.workflows.get(task.pipeline_id)) |workflow| {
             if (workflow.on_success.transition_to.len > 0) {
                 return workflow.on_success.transition_to;
@@ -1515,4 +1540,70 @@ test "TrackerState countByState" {
     try std.testing.expectEqual(@as(u32, 2), state.countByState("in_progress"));
     try std.testing.expectEqual(@as(u32, 1), state.countByState("rework"));
     try std.testing.expectEqual(@as(u32, 0), state.countByState("done"));
+}
+
+// ── Converge verdict parsing + trigger selection ─────────────────────
+
+/// Parse the LAST `CONVERGE-VERDICT: blockers=N` from a reviewer's output.
+/// Last-match wins so a verdict quoted earlier in the review can't shadow the
+/// reviewer's own final line. Returns null when no well-formed verdict line is
+/// present — the caller treats null as a degraded review and fails closed.
+fn parseConvergeVerdict(output: []const u8) ?i64 {
+    const marker = "CONVERGE-VERDICT:";
+    const bkey = "blockers=";
+    var result: ?i64 = null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search, marker)) |idx| {
+        search = idx + marker.len;
+        const rest = output[search..];
+        const bpos = std.mem.indexOf(u8, rest, bkey) orelse continue;
+        // `blockers=` must be on the same line as the marker.
+        if (std.mem.indexOfScalar(u8, rest[0..bpos], '\n') != null) continue;
+        const num = rest[bpos + bkey.len ..];
+        var end: usize = 0;
+        while (end < num.len and num[end] >= '0' and num[end] <= '9') : (end += 1) {}
+        if (end == 0) continue;
+        result = std.fmt.parseInt(i64, num[0..end], 10) catch continue;
+    }
+    return result;
+}
+
+/// Select the converge transition trigger from the current stage's available
+/// transitions. Fail-closed: a null verdict returns null (the caller fails the
+/// task rather than guessing). blockers>0 selects the `block` transition;
+/// blockers==0 selects the single non-block advance transition. The nulltickets
+/// gate is the backstop — even a wrong pick cannot escalate past a blocker.
+fn selectConvergeTrigger(blockers: ?i64, transitions: []const tracker_client.TransitionInfo) ?[]const u8 {
+    const b = blockers orelse return null;
+    if (b > 0) {
+        for (transitions) |t| {
+            if (std.mem.eql(u8, t.trigger, "block")) return t.trigger;
+        }
+        return null;
+    }
+    for (transitions) |t| {
+        if (!std.mem.eql(u8, t.trigger, "block")) return t.trigger;
+    }
+    return null;
+}
+
+test "parseConvergeVerdict reads the last blockers count, fail-closed on garbage" {
+    try std.testing.expectEqual(@as(?i64, 0), parseConvergeVerdict("ok\nCONVERGE-VERDICT: blockers=0\n"));
+    try std.testing.expectEqual(@as(?i64, 3), parseConvergeVerdict("CONVERGE-VERDICT: blockers=3"));
+    // last match wins — an earlier quoted verdict must not shadow the final line
+    try std.testing.expectEqual(@as(?i64, 2), parseConvergeVerdict("e.g. CONVERGE-VERDICT: blockers=9\n...\nCONVERGE-VERDICT: blockers=2"));
+    // no verdict, or a non-numeric count → null (degraded → fail closed)
+    try std.testing.expectEqual(@as(?i64, null), parseConvergeVerdict("no verdict in here"));
+    try std.testing.expectEqual(@as(?i64, null), parseConvergeVerdict("CONVERGE-VERDICT: blockers=oops"));
+}
+
+test "selectConvergeTrigger is fail-closed and gate-aligned" {
+    const T = tracker_client.TransitionInfo;
+    const trans = [_]T{
+        .{ .trigger = "escalate", .to = "cto-review" },
+        .{ .trigger = "block", .to = "blocked" },
+    };
+    try std.testing.expectEqualStrings("escalate", selectConvergeTrigger(0, &trans).?); // clean → advance
+    try std.testing.expectEqualStrings("block", selectConvergeTrigger(2, &trans).?); // blockers → block
+    try std.testing.expect(selectConvergeTrigger(null, &trans) == null); // no verdict → fail closed
 }

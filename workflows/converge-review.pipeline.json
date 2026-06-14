@@ -1,0 +1,18 @@
+{
+  "name": "converge-review",
+  "definition": {
+    "initial": "staff-review",
+    "states": {
+      "staff-review": { "agent_role": "v_staff-engineer", "description": "Staff engineer review of the diff" },
+      "cto-review": { "agent_role": "v_cto", "description": "CTO converge gate" },
+      "approved": { "terminal": true, "description": "Approved — no blockers from any persona" },
+      "blocked": { "terminal": true, "description": "Blocked by review blockers" }
+    },
+    "transitions": [
+      { "from": "staff-review", "to": "cto-review", "trigger": "escalate", "required_gates": ["no-blockers"] },
+      { "from": "staff-review", "to": "blocked", "trigger": "block" },
+      { "from": "cto-review", "to": "approved", "trigger": "approve", "required_gates": ["no-blockers"] },
+      { "from": "cto-review", "to": "blocked", "trigger": "block" }
+    ]
+  }
+}
